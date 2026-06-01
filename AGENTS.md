@@ -10,6 +10,10 @@ This repository is the `fuse-spec` plugin for Codex (and Claude Code). It provid
 - **`spec-tasks`** — produces a collapsed, dependency-tagged `tasks.md`.
 - **`spec-execute`** — runs tasks in dependency waves with capped parallel subagents.
 
+## Commands
+
+- **`/reconcile-spec [spec-dir]`** — reconcile a spec's three files against the actual codebase: mark tasks done/undone to match reality, flag design drift and requirement gaps, add newly discovered tasks, and re-run the consistency checks.
+
 ## Spec storage convention
 
 Each spec lives in its own folder:

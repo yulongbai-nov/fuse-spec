@@ -63,12 +63,24 @@ Use the spec skill to build <feature>.
 
 Or jump straight to a phase (e.g. `spec-execute` to run an existing `tasks.md`).
 
+### Keeping specs honest
+
+Specs drift as code is written outside the runner. Reconcile a spec against the actual codebase with the command:
+
+```
+/reconcile-spec .specs/001-rate-limiter
+```
+
+It marks tasks done/undone to match reality, flags design drift and requirement gaps, adds any newly discovered tasks, and re-runs the consistency checks — so the spec reflects codebase truth rather than stale intentions.
+
 ## Layout
 
 ```
 .claude-plugin/plugin.json   Claude manifest
 .codex-plugin/plugin.json    Codex manifest
 AGENTS.md                    Codex root doc
+commands/
+  reconcile-spec.md          sync a spec to codebase truth
 skills/
   spec/                      orchestrator
   spec-requirements/         grill → requirements.md | bugfix.md

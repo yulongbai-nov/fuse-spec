@@ -64,3 +64,7 @@ Requirements and design are not a one-way street. When the user revises an earli
 ## 5. Status
 
 On request, report: current mode, which phase/gate the spec is at, and the latest `sync_check` result (clean / errors / warnings).
+
+## Reconciling with the codebase
+
+When a spec may have drifted from the real code (tasks implemented outside the runner, design changed during coding), use the `/reconcile-spec` command to update the spec to codebase truth — it re-marks tasks, flags design/requirement drift, and re-runs the consistency checks.
