@@ -1,0 +1,30 @@
+{
+  "name": "fuse-spec",
+  "version": "0.1.0",
+  "description": "Spec-driven development workflow: grill requirements into EARS specs, design with traceability, generate executable tasks, and run them in dependency waves. Use when starting a feature, fixing a bug, writing a spec, or when the user mentions requirements, design, tasks, or spec-driven development.",
+  "author": {
+    "name": "novos"
+  },
+  "license": "MIT",
+  "keywords": [
+    "codex-plugin",
+    "spec-driven",
+    "requirements",
+    "design",
+    "tasks",
+    "ears",
+    "tdd",
+    "planning"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Fuse Spec",
+    "shortDescription": "Spec-driven development: requirements, design, tasks, execution.",
+    "longDescription": "Fuse Spec runs a spec-driven workflow that interviews you into EARS requirements, produces a traceable design, generates collapsed executable tasks, and runs them in dependency waves with capped parallel subagents.",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ]
+  }
+}

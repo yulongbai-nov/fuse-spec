@@ -1,0 +1,7 @@
+{
+  "name": "fuse-spec",
+  "description": "Spec-driven development workflow: grill requirements into EARS specs, design with traceability, generate executable tasks, and run them in dependency waves. Use when starting a feature, fixing a bug, writing a spec, or when the user mentions requirements, design, tasks, or spec-driven development.",
+  "author": {
+    "name": "novos"
+  }
+}
