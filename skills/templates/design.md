@@ -8,9 +8,19 @@
 
 [High-level summary of the approach and how it addresses the requirements.]
 
+## Decision Rationale
+
+<!-- Preserve the requirements decision IDs where possible. Every material
+design choice needs a reason, evidence/assumption, and reopen trigger. -->
+
+| Decision | Choice | Why | Evidence / assumption | Reopen trigger |
+|----------|--------|-----|-----------------------|----------------|
+| D1: [decision] | [chosen design] | [mechanism, tradeoff, or constraint] | [evidence or assumption] | [result that would reopen it] |
+
 ### Key Design Decisions
 
-- [Decision and its rationale.]
+- **Decision:** [choice]. **Why:** [mechanism, tradeoff, or constraint].
+- **Evidence / assumption:** [what supports it]. **Reopen trigger:** [what would change it].
 - [Decision and its rationale.]
 
 ## Architecture

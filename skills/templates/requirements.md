@@ -17,6 +17,15 @@ implementation details. Add a row the first time a term needs pinning down. -->
 |------|------------|
 | [Term] | [Precise, single-meaning definition.] |
 
+## Decision Rationale Register
+
+<!-- Record why each material decision was chosen, not only what was chosen.
+Use stable D<n> ids when later design or tasks need to refer to a decision. -->
+
+| Decision | Requirement IDs | Choice | Why | Evidence / assumption | Reopen trigger |
+|----------|-----------------|--------|-----|-----------------------|----------------|
+| D1: [decision] | R1 | [chosen option] | [mechanism, tradeoff, or constraint] | [evidence or explicit assumption] | [result that would reopen it] |
+
 ## Requirements
 
 <!--
