@@ -59,11 +59,12 @@
     - Use the role profiles and availability handling defined in R7. Resolve and record actual host model, effort, and tools at dispatch; do not silently substitute or bypass configured limits.
     - Preserve bounded one-spec execution, in-scope task splitting/reordering, review counters, carry-forward findings, the one RCA attempt per hard blocker, and shared nested-agent concurrency accounting. Hooks remain optional context aids, never required acceptance gates.
 
-- [ ] T7 Add serialized GitHub PR publication and exact merge-candidate gates  [id:T7 deps:T3,T4,T5 impl:R3,R4,R5,D-PRIntegration,D-RunControl,D-Verification]
+- [x] T7 Add serialized GitHub PR publication and exact merge-candidate gates  [id:T7 deps:T3,T4,T5 impl:R3,R4,R5,D-PRIntegration,D-RunControl,D-Verification]
     - **Files:** `skills/scripts/fuse_git.py`, `skills/scripts/fuse_pr.py`, `tests/test_pr_provider.py`
     - Test isolated worker commits, one coordinator publisher, task-to-PR mapping, early draft-PR creation, per-job push/checkpoint order, acyclic derived PR dependencies, and refusal to force-push or bypass repository protection.
     - Use `gh` where available for PR/status operations and record provider, PR, base, and head identities. Keep provider calls behind a testable adapter and report missing CLI/auth/permissions as a blocker.
-    - Materialize the integrated review candidate and the exact current base plus prerequisites plus target PR candidate before each merge. Recompute and rerun affected checks/reviews after base or prior-merge changes.
+    - Materialize the integrated review candidate and the exact current base plus target PR candidate before each merge. Prove every task or branch prerequisite PR is merged and its merge commit is contained in the current base; do not queue a target while a prerequisite remains open. Require only the target's transitive PR closure, not unrelated PR heads.
+    - Bind merge-group checks and all three Fuse review levels to the provider's exact merge-group identity, including the base, merged prerequisite identities, and target head. A merge queue plus target-head match alone is insufficient. If the provider cannot atomically enforce that binding, refuse automatic enqueue and report the blocker.
     - Merge only the selected PR when current checks, all required review levels, unresolved-finding policy, and repository mergeability satisfy R4; otherwise continue monitoring or report the blocker.
 
 - [ ] T8 Route `/reconcile-spec` and task checkbox updates through the shared record  [id:T8 deps:T3,T5,T6 impl:R2,R3,R4,R5,D-RunControl,D-Coordinator]
