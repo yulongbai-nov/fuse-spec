@@ -227,7 +227,11 @@
           "items": { "type": "string", "pattern": "^evd_[0-9a-f]{32}$" },
           "uniqueItems": true
         },
-        "history": { "type": "array", "items": { "$ref": "#/$defs/findingHistory" } },
+        "history": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/findingHistory" }
+        },
         "created_at": { "type": "string", "format": "date-time" }
       },
       "additionalProperties": false

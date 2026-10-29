@@ -40,6 +40,17 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
 
 
+def _candidate_digest(manifest: Mapping[str, Any]) -> str:
+    payload = json.dumps(
+        manifest,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _schema_errors(schema_path: Path | None) -> Draft202012Validator:
     path = schema_path or _default_schema_path()
     try:
@@ -87,6 +98,7 @@ def _semantic_errors(record: Mapping[str, Any]) -> list[str]:
     _unique_ids(record["operator_decisions"], "id", "operator decision")
     attempt_ids: set[str] = set()
     host_handles: set[str] = set()
+    active_task_ids: set[str] = set()
 
     for assignment in assignments:
         task_id = assignment["task_id"]
@@ -103,6 +115,10 @@ def _semantic_errors(record: Mapping[str, Any]) -> list[str]:
             errors.append(
                 f"assignment {assignment['id']} reservation does not match launch state"
             )
+        if should_be_reserved:
+            if task_id in active_task_ids:
+                errors.append(f"task {task_id} has multiple active assignments")
+            active_task_ids.add(task_id)
         for attempt in assignment["attempts"]:
             attempt_id = attempt["id"]
             if attempt_id in attempt_ids:
@@ -150,7 +166,25 @@ def _semantic_errors(record: Mapping[str, Any]) -> list[str]:
             errors.append(
                 f"evidence {item['id']} references unknown assignment {assignment_id}"
             )
+    for candidate in candidates:
+        if candidate["candidate_id"] != _candidate_digest(candidate["manifest"]):
+            errors.append(
+                f"candidate id does not match its manifest: {candidate['candidate_id']}"
+            )
     for finding in findings:
+        latest_action = finding["history"][-1]["action"]
+        expected_status = {
+            "opened": "open",
+            "reopened": "open",
+            "resolved": "resolved",
+            "dismissed": "dismissed",
+            "deferred": "deferred",
+        }[latest_action]
+        if finding["status"] != expected_status:
+            errors.append(
+                f"finding {finding['id']} status does not match latest "
+                "disposition action"
+            )
         for evidence_id in finding["evidence_ids"]:
             if evidence_id not in evidence_ids:
                 errors.append(
@@ -244,6 +278,12 @@ def _validate_history(previous: Mapping[str, Any], current: Mapping[str, Any]) -
         ):
             raise RecordError("cannot retry while the previous attempt is unresolved")
         for old_attempt, new_attempt in zip(old_attempts, new_attempts):
+            old_host_handle = old_attempt.get("host_handle")
+            if (
+                old_host_handle is not None
+                and new_attempt.get("host_handle") != old_host_handle
+            ):
+                raise RecordError("attempt host handle is immutable once bound")
             if (
                 old_attempt["status"] in TERMINAL_ATTEMPT_STATES
                 and old_attempt != new_attempt
@@ -379,14 +419,7 @@ def add_candidate(
     """Append a content-addressed candidate manifest."""
     manifest_copy = copy.deepcopy(dict(manifest))
     provenance_copy = copy.deepcopy(dict(source_provenance or {}))
-    payload = json.dumps(
-        manifest_copy,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode("utf-8")
-    candidate_id = hashlib.sha256(payload).hexdigest()
+    candidate_id = _candidate_digest(manifest_copy)
     for existing in record["candidates"]:
         if existing["candidate_id"] == candidate_id:
             if existing["manifest"] != manifest_copy:
@@ -529,6 +562,15 @@ def append_retry(record: dict[str, Any], assignment_id: str) -> dict[str, Any]:
         raise RecordError(f"unknown assignment {assignment_id}")
     if assignment["attempts"][-1]["status"] not in TERMINAL_ATTEMPT_STATES:
         raise RecordError("cannot retry while the previous attempt is unresolved")
+    if any(
+        item["task_id"] == assignment["task_id"]
+        and item["id"] != assignment_id
+        and item["reservation_active"]
+        for item in record["assignments"]
+    ):
+        raise RecordError(
+            f"task {assignment['task_id']} already has an active assignment"
+        )
     attempt = {"id": _new_id("att"), "status": "prepared", "created_at": _now()}
     assignment["attempts"].append(attempt)
     assignment["status"] = "prepared"

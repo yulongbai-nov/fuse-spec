@@ -412,6 +412,8 @@ def checkpoint_run(
         validate_run_record(record, previous=previous)
 
     remote_revision, remote_record = _fetch_remote_state(root, remote, spec_id, run_id)
+    if remote_record is not None:
+        validate_run_record(record, previous=remote_record)
     if remote_revision != expected_revision:
         reconciliation = (
             reconcile_remote(record, remote_record)
@@ -448,6 +450,8 @@ def checkpoint_run(
     candidate["git"]["state_revision"] = base_state_revision + 1
     candidate["checkpointed_at"] = _now()
     validate_run_record(candidate, previous=previous)
+    if remote_record is not None:
+        validate_run_record(candidate, previous=remote_record)
     commit = _build_state_commit(root, candidate, remote_revision, ref)
     push = _git(root, "push", str(remote), f"{commit}:{ref}", check=False)
     if push.returncode != 0:

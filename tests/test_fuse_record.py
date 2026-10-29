@@ -85,6 +85,15 @@ def test_candidate_identity_excludes_source_provenance() -> None:
     assert first["source_provenance"]["commit"] == "a" * 40
 
 
+def test_changed_candidate_manifest_cannot_keep_a_stale_content_id() -> None:
+    record = make_record()
+    candidate = fuse_record.add_candidate(record, {"source": "original"})
+    candidate["manifest"]["source"] = "changed"
+
+    with pytest.raises(fuse_record.RecordError, match="candidate id does not match"):
+        fuse_record.validate_run_record(record)
+
+
 def test_each_evidence_record_preserves_observed_provenance_and_check_inputs() -> None:
     record = make_record()
     manifest = {"verification_inputs": {"tree": "stable"}}
@@ -149,6 +158,53 @@ def test_retry_appends_new_attempt_and_preserves_terminal_history() -> None:
         fuse_record.validate_run_record(record, previous=before_retry)
 
 
+def test_retry_is_rejected_when_another_assignment_for_the_task_is_active() -> None:
+    record = make_record()
+    first = fuse_record.prepare_assignment(record, "T1", "Feature", "worker")
+    fuse_record.record_attempt_result(
+        record, first["id"], first["attempts"][0]["id"], "failed"
+    )
+    fuse_record.prepare_assignment(record, "T1", "Bug Fix", "worker")
+
+    with pytest.raises(
+        fuse_record.RecordError, match="already has an active assignment"
+    ):
+        fuse_record.append_retry(record, first["id"])
+
+
+def test_record_rejects_multiple_active_assignments_for_one_task() -> None:
+    record = make_record()
+    first = fuse_record.prepare_assignment(record, "T1", "Feature", "worker")
+    fuse_record.record_attempt_result(
+        record, first["id"], first["attempts"][0]["id"], "failed"
+    )
+    fuse_record.prepare_assignment(record, "T1", "Bug Fix", "worker")
+    first["status"] = "prepared"
+    first["reservation_active"] = True
+    first["attempts"][-1]["status"] = "prepared"
+
+    with pytest.raises(fuse_record.RecordError, match="multiple active assignments"):
+        fuse_record.validate_run_record(record)
+
+
+def test_bound_host_handle_is_immutable_across_checkpoints() -> None:
+    record = make_record()
+    assignment = fuse_record.prepare_assignment(record, "T1", "Feature", "worker")
+    attempt = assignment["attempts"][0]
+    fuse_record.bind_launch(record, assignment["id"], attempt["id"], "host-1")
+    previous = copy.deepcopy(record)
+
+    changed = copy.deepcopy(record)
+    changed["assignments"][0]["attempts"][0]["host_handle"] = "host-2"
+    with pytest.raises(fuse_record.RecordError, match="host handle is immutable"):
+        fuse_record.validate_run_record(changed, previous=previous)
+
+    cleared = copy.deepcopy(record)
+    del cleared["assignments"][0]["attempts"][0]["host_handle"]
+    with pytest.raises(fuse_record.RecordError, match="host handle is immutable"):
+        fuse_record.validate_run_record(cleared, previous=previous)
+
+
 def test_effective_policy_snapshot_cannot_change_between_checkpoints() -> None:
     original = make_record()
     changed = copy.deepcopy(original)
@@ -158,6 +214,35 @@ def test_effective_policy_snapshot_cannot_change_between_checkpoints() -> None:
         fuse_record.RecordError, match="effective policy snapshot is immutable"
     ):
         fuse_record.validate_run_record(changed, previous=original)
+
+
+def test_finding_status_must_follow_its_nonempty_disposition_history() -> None:
+    record = make_record()
+    finding = fuse_record.add_finding(record, "T1", "Fix the bug")
+
+    status_only_change = copy.deepcopy(record)
+    status_only_change["findings"][0]["status"] = "resolved"
+    with pytest.raises(fuse_record.RecordError, match="status does not match latest"):
+        fuse_record.validate_run_record(status_only_change)
+
+    cleared_history = copy.deepcopy(record)
+    cleared_history["findings"][0]["history"] = []
+    with pytest.raises(fuse_record.RecordError, match="history"):
+        fuse_record.validate_run_record(cleared_history)
+
+    resolved = copy.deepcopy(record)
+    resolved_finding = resolved["findings"][0]
+    resolved_finding["status"] = "resolved"
+    resolved_finding["history"].append(
+        {
+            "at": resolved["checkpointed_at"],
+            "action": "resolved",
+            "rationale": "the fix is verified",
+            "evidence_ids": [],
+        }
+    )
+    fuse_record.validate_run_record(resolved, previous=record)
+    assert finding["status"] == "open"
 
 
 def test_review_and_rca_counters_must_be_unique() -> None:

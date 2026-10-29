@@ -203,6 +203,49 @@ def test_latest_remote_sha_does_not_authorize_checkpoint_from_stale_local_state(
     assert git(remote, "rev-parse", ref) == competing_revision
 
 
+def test_missing_local_record_cannot_bypass_remote_policy_immutability(
+    tmp_path: Path,
+) -> None:
+    repository, remote = repository_with_bare_remote(tmp_path)
+    record = fuse_state.initialize_run(repository, "001-demo", {"roles": {}})
+    revision = fuse_state.checkpoint_run(repository, remote, record)
+    path = fuse_state.run_record_path(repository, record["run_id"])
+    path.unlink()
+    record["effective_policy_snapshot"]["roles"]["worker"] = {"model": "changed"}
+
+    with pytest.raises(ValueError, match="effective policy snapshot is immutable"):
+        fuse_state.checkpoint_run(
+            repository, remote, record, expected_revision=revision
+        )
+
+    assert (
+        git(remote, "rev-parse", fuse_state.state_ref("001-demo", record["run_id"]))
+        == revision
+    )
+    assert not path.exists()
+
+
+def test_missing_local_record_allows_update_based_on_fetched_remote_state(
+    tmp_path: Path,
+) -> None:
+    repository, remote = repository_with_bare_remote(tmp_path)
+    record = fuse_state.initialize_run(repository, "001-demo", {"roles": {}})
+    initial_revision = fuse_state.checkpoint_run(repository, remote, record)
+    fuse_state.run_record_path(repository, record["run_id"]).unlink()
+    record["status"] = "paused"
+
+    revision = fuse_state.checkpoint_run(
+        repository, remote, record, expected_revision=initial_revision
+    )
+
+    assert (
+        git(remote, "rev-parse", fuse_state.state_ref("001-demo", record["run_id"]))
+        == revision
+    )
+    assert record["status"] == "paused"
+    assert fuse_state.load_run(repository, record["run_id"])["status"] == "paused"
+
+
 def test_non_fast_forward_push_fetches_and_reconciles_competing_update(
     tmp_path: Path,
 ) -> None:
