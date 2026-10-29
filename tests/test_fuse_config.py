@@ -95,6 +95,8 @@ def test_init_reuses_project_package_manager_and_creates_valid_policy(
     assert config["roles"]["rca_reviewer"]["model"] == "latest-luna"
     assert config["limits"]["review"]["max_repair_rounds_per_level"] == 2
     assert config["limits"]["rca"]["attempts_per_hard_blocker"] == 1
+    assert config["limits"]["checks"]["timeout_seconds"] == 1800
+    assert config["limits"]["checks"]["max_output_bytes_per_stream"] == 1048576
     assert config["budgets"]["elapsed_time_seconds"] == "unset"
     assert config["budgets"]["model_usage"]["limit"] == "unset"
     assert config["checks"]["pytest"]["command"][0] == "uv"
@@ -570,11 +572,24 @@ def test_run_overrides_use_configured_fields_and_bounds(tmp_path: Path) -> None:
         "--overrides",
         '{"limits.review.max_repair_rounds_per_level":1}',
     )
+    accepted_check_limits = run_config(
+        "validate",
+        str(config_path),
+        "--overrides",
+        '{"limits.checks.timeout_seconds":3600,'
+        '"limits.checks.max_output_bytes_per_stream":2097152}',
+    )
     rejected = run_config(
         "validate",
         str(config_path),
         "--overrides",
         '{"limits.review.max_repair_rounds_per_level":3}',
+    )
+    rejected_check_limit = run_config(
+        "validate",
+        str(config_path),
+        "--overrides",
+        '{"limits.checks.timeout_seconds":0}',
     )
     unknown = run_config(
         "validate",
@@ -584,8 +599,11 @@ def test_run_overrides_use_configured_fields_and_bounds(tmp_path: Path) -> None:
     )
 
     assert accepted.returncode == 0, accepted.stderr
+    assert accepted_check_limits.returncode == 0, accepted_check_limits.stderr
     assert rejected.returncode != 0
     assert "bound" in rejected.stderr.lower()
+    assert rejected_check_limit.returncode != 0
+    assert "bound" in rejected_check_limit.stderr.lower()
     assert unknown.returncode != 0
     assert "allowed" in unknown.stderr.lower()
 

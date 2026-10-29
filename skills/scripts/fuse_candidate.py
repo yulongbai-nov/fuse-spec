@@ -6,7 +6,6 @@ from __future__ import annotations
 import copy
 import hashlib
 import os
-import re
 import stat
 import subprocess
 from collections.abc import Iterable, Mapping
@@ -15,16 +14,18 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from fuse_config import validate_config
+    from fuse_markdown import markdown_fence_line_flags, task_checkbox_row_match
     from fuse_record import add_candidate, validate_run_record
 else:
     try:
         from .fuse_config import validate_config
+        from .fuse_markdown import markdown_fence_line_flags, task_checkbox_row_match
         from .fuse_record import add_candidate, validate_run_record
     except ImportError:
         from fuse_config import validate_config
+        from fuse_markdown import markdown_fence_line_flags, task_checkbox_row_match
         from fuse_record import add_candidate, validate_run_record
 
-TASK_CHECKBOX = re.compile(r"^(\s*[-*]\s+\[)[xX](\])(?=\s+.*\[id:[^\]]+\])")
 STATE_PATH_PREFIX = PurePosixPath(".fuse/runs")
 
 
@@ -39,15 +40,18 @@ def _sha256(data: bytes) -> str:
 def normalize_task_checkboxes(markdown: str) -> str:
     """Normalize declared task progress while preserving all approved task text."""
     output: list[str] = []
-    in_fence = False
-    for line in markdown.splitlines(keepends=True):
-        if line.lstrip().startswith("```"):
-            in_fence = not in_fence
-            output.append(line)
-        elif in_fence:
+    lines = markdown.splitlines(keepends=True)
+    for line, in_fence in zip(lines, markdown_fence_line_flags(lines), strict=True):
+        if in_fence:
             output.append(line)
         else:
-            output.append(TASK_CHECKBOX.sub(r"\1 \2", line, count=1))
+            checkbox_row = task_checkbox_row_match(line)
+            if checkbox_row is not None and checkbox_row.group("status").lower() == "x":
+                status_start = checkbox_row.start("status")
+                status_end = checkbox_row.end("status")
+                output.append(line[:status_start] + " " + line[status_end:])
+            else:
+                output.append(line)
     return "".join(output)
 
 
@@ -247,6 +251,7 @@ def build_candidate_manifest(
         "approved_spec": _approved_spec_inputs(spec_root, root),
         "effective_policy": copy.deepcopy(dict(effective_policy_snapshot)),
         "check_definitions": copy.deepcopy(dict(checks)),
+        "check_execution_limits": copy.deepcopy(dict(config["limits"]["checks"])),
         "toolchain": copy.deepcopy(dict(toolchain)),
         "required_inputs": _required_input_digests(root, required_inputs),
     }

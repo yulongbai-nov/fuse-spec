@@ -136,6 +136,82 @@ def test_public_task_parser_reuses_markdown_files_syntax() -> None:
     assert done == set()
 
 
+@pytest.mark.parametrize(
+    ("opening", "closing"),
+    [("```markdown", "````"), ("~~~markdown", "~~~~")],
+)
+def test_planner_ignores_tasks_inside_valid_commonmark_fences(
+    tmp_path: Path, opening: str, closing: str
+) -> None:
+    result = run_planner(
+        tmp_path,
+        "- [ ] T1 Real [id:T1 deps: impl:R1]\n"
+        f"{opening}\n"
+        "- [x] T9 Example [id:T9 deps: impl:R1]\n"
+        f"{closing}\n"
+        "- [ ] T2 After [id:T2 deps:T1 impl:R1]\n",
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["waves"] == [["T1"], ["T2"]]
+    assert list(payload["tasks"]) == ["T1", "T2"]
+
+
+def test_planner_ignores_task_in_fence_nested_in_task_list_item(
+    tmp_path: Path,
+) -> None:
+    result = run_planner(
+        tmp_path,
+        "- [ ] T1 Parent [id:T1 deps: impl:R1]\n"
+        "    - T2 nested detail without an ID\n"
+        "    ~~~markdown\n"
+        "    - [x] T9 Example [id:T9 deps: impl:R1]\n"
+        "    ~~~~\n"
+        "- [ ] T3 After [id:T3 deps:T1 impl:R1]\n",
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["waves"] == [["T1"], ["T3"]]
+    assert list(payload["tasks"]) == ["T1", "T3"]
+
+
+def test_planner_does_not_treat_root_four_space_code_as_a_fence(
+    tmp_path: Path,
+) -> None:
+    result = run_planner(
+        tmp_path,
+        "    ~~~markdown\n"
+        "    example code\n"
+        "    ~~~\n"
+        "- [ ] T1 Real [id:T1 deps: impl:R1]\n"
+        "- [ ] T2 After [id:T2 deps:T1 impl:R1]\n",
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["waves"] == [["T1"], ["T2"]]
+    assert list(payload["tasks"]) == ["T1", "T2"]
+
+
+def test_planner_ignores_quoted_task_example_without_checkbox_row_prefix(
+    tmp_path: Path,
+) -> None:
+    result = run_planner(
+        tmp_path,
+        "> ```markdown\n"
+        "> - [ ] T9 Example [id:T9 deps: impl:R1]\n"
+        "> ```\n"
+        "- [ ] T1 Real [id:T1 deps: impl:R1]\n",
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["waves"] == [["T1"]]
+    assert list(payload["tasks"]) == ["T1"]
+
+
 def test_disjoint_write_scopes_remain_parallel(tmp_path: Path) -> None:
     result = run_planner(
         tmp_path,

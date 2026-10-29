@@ -9,9 +9,11 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import tempfile
+import threading
 import uuid
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
@@ -89,6 +91,19 @@ class CheckResult(TypedDict):
     evidence_id: str
 
 
+class BoundedCommandResult(TypedDict):
+    """Captured result of a check process with shared resource limits."""
+
+    returncode: int
+    stdout: str
+    stderr: str
+    timed_out: bool
+    lingering_output_process: bool
+    capture_incomplete: bool
+    stdout_truncated: bool
+    stderr_truncated: bool
+
+
 GIT_OBJECT_ID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 OUTPUT_METADATA_PREFIX = "fuse-check-output-v1 "
 
@@ -99,6 +114,122 @@ def _is_git_object_id(value: Any) -> bool:
         and GIT_OBJECT_ID.fullmatch(value) is not None
         and set(value) != {"0"}
     )
+
+
+def _read_bounded_pipe(pipe: Any, maximum_bytes: int) -> tuple[str, bool]:
+    """Drain a child pipe while retaining no more than the configured bytes."""
+    captured = bytearray()
+    truncated = False
+    while True:
+        chunk = pipe.read(64 * 1024)
+        if not chunk:
+            break
+        remaining = maximum_bytes - len(captured)
+        if remaining > 0:
+            captured.extend(chunk[:remaining])
+        if len(chunk) > max(remaining, 0):
+            truncated = True
+    return captured.decode("utf-8", errors="replace"), truncated
+
+
+def _terminate_check_process(process: subprocess.Popen[bytes]) -> None:
+    """Terminate a check process group where supported, then fall back to child."""
+    try:
+        if os.name == "nt":
+            process.kill()
+        else:
+            os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        if process.poll() is None:
+            process.kill()
+    except OSError:
+        process.kill()
+
+
+def _run_bounded_check_command(
+    command: list[str],
+    cwd: Path,
+    *,
+    timeout_seconds: int,
+    max_output_bytes_per_stream: int,
+) -> BoundedCommandResult:
+    """Execute a check with bounded wall time and in-memory output capture."""
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=os.name != "nt",
+    )
+    if process.stdout is None or process.stderr is None:
+        _terminate_check_process(process)
+        raise CheckError("check process pipes could not be created")
+
+    captured: dict[str, tuple[str, bool]] = {}
+    capture_errors: dict[str, str] = {}
+
+    def drain(name: str, pipe: Any) -> None:
+        try:
+            captured[name] = _read_bounded_pipe(pipe, max_output_bytes_per_stream)
+        except (OSError, ValueError) as error:
+            capture_errors[name] = str(error)
+
+    readers = [
+        threading.Thread(
+            target=drain,
+            args=(name, pipe),
+            name=f"fuse-check-{name}",
+            daemon=True,
+        )
+        for name, pipe in (("stdout", process.stdout), ("stderr", process.stderr))
+    ]
+    for reader in readers:
+        reader.start()
+
+    timed_out = False
+    try:
+        process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _terminate_check_process(process)
+        process.wait()
+
+    for reader in readers:
+        reader.join(timeout=1)
+    lingering_output_process = any(reader.is_alive() for reader in readers)
+    if lingering_output_process:
+        _terminate_check_process(process)
+        process.stdout.close()
+        process.stderr.close()
+        for reader in readers:
+            reader.join(timeout=1)
+
+    returncode = process.returncode
+    if returncode is None:
+        raise CheckError("check process did not terminate after its execution limit")
+    stdout, stdout_truncated = captured.get("stdout", ("", True))
+    stderr, stderr_truncated = captured.get("stderr", ("", True))
+    if "stdout" in capture_errors:
+        stdout += f"\n[output capture error: {capture_errors['stdout']}]"
+        stdout_truncated = True
+    if "stderr" in capture_errors:
+        stderr += f"\n[output capture error: {capture_errors['stderr']}]"
+        stderr_truncated = True
+    if lingering_output_process:
+        stdout_truncated = True
+        stderr_truncated = True
+
+    return {
+        "returncode": returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+        "timed_out": timed_out,
+        "lingering_output_process": lingering_output_process,
+        "capture_incomplete": bool(capture_errors) or lingering_output_process,
+        "stdout_truncated": stdout_truncated,
+        "stderr_truncated": stderr_truncated,
+    }
 
 
 def _git(
@@ -509,23 +640,39 @@ def prepare_toolchain(
             "tool_versions": {},
         }
 
+    check_limits = config["limits"]["checks"]
     try:
-        sync = subprocess.run(
+        sync = _run_bounded_check_command(
             [manager, "sync", "--locked"],
-            cwd=root,
-            capture_output=True,
-            check=False,
-            text=True,
-            timeout=1200,
+            root,
+            timeout_seconds=check_limits["timeout_seconds"],
+            max_output_bytes_per_stream=check_limits["max_output_bytes_per_stream"],
         )
-    except (OSError, subprocess.TimeoutExpired) as error:
+    except (OSError, CheckError) as error:
         return {
             "ready": False,
             "summary": f"locked tool restore failed: {error}",
             "tool_versions": {"package_manager": manager},
         }
-    if sync.returncode != 0:
-        detail = (sync.stderr or sync.stdout).strip()
+    if sync["timed_out"]:
+        return {
+            "ready": False,
+            "summary": (
+                "locked tool restore timed out after "
+                f"{check_limits['timeout_seconds']} seconds"
+            ),
+            "tool_versions": {"package_manager": manager},
+        }
+    if sync["capture_incomplete"]:
+        return {
+            "ready": False,
+            "summary": "locked tool restore output capture did not complete",
+            "tool_versions": {"package_manager": manager},
+        }
+    if sync["returncode"] != 0:
+        detail = (sync["stderr"] or sync["stdout"]).strip()
+        if sync["stderr_truncated"] or sync["stdout_truncated"]:
+            detail += " (restore output was truncated)"
         return {
             "ready": False,
             "summary": f"{manager} sync --locked failed: {detail}",
@@ -660,6 +807,10 @@ def _candidate_matches_config(
         "checks"
     ) or verification.get("toolchain") != config.get("toolchain"):
         raise CheckError("candidate configuration context is stale")
+    if verification.get("check_execution_limits") != config.get("limits", {}).get(
+        "checks"
+    ):
+        raise CheckError("candidate check execution limits are stale")
 
 
 def _artifact_execution_metadata(
@@ -671,9 +822,12 @@ def _artifact_execution_metadata(
     expected = {
         "candidate_id": evidence["candidate_id"],
         "check_id": evidence["check_id"],
-        "command": config["checks"][evidence["check_id"]]["command"],
         "config_digest": evidence["config_digest"],
         "check_definition_digest": evidence["check_definition_digest"],
+        "timeout_seconds": config["limits"]["checks"]["timeout_seconds"],
+        "max_output_bytes_per_stream": config["limits"]["checks"][
+            "max_output_bytes_per_stream"
+        ],
         "source_commit": source["commit"],
         "pinned_commit": source["pinned_worktree_commit"],
         "pinned_tree": source["pinned_worktree_tree"],
@@ -707,6 +861,31 @@ def _artifact_execution_metadata(
             or PurePosixPath(spec_dir).is_absolute()
             or ".." in PurePosixPath(spec_dir).parts
             or "\\" in spec_dir
+        ):
+            continue
+        if (
+            type(metadata.get("timed_out")) is not bool
+            or type(metadata.get("capture_incomplete")) is not bool
+            or type(metadata.get("stdout_truncated")) is not bool
+            or type(metadata.get("stderr_truncated")) is not bool
+            or type(metadata.get("lingering_output_process")) is not bool
+            or (
+                evidence["outcome"] == "pass"
+                and (
+                    metadata["timed_out"]
+                    or metadata["capture_incomplete"]
+                    or metadata["lingering_output_process"]
+                )
+            )
+        ):
+            continue
+        configured_command = config["checks"][evidence["check_id"]]["command"]
+        executed_command = [
+            argument.replace("{spec_dir}", spec_dir) for argument in configured_command
+        ]
+        if (
+            metadata.get("configured_command") != configured_command
+            or metadata.get("executed_command") != executed_command
         ):
             continue
         return cast(Mapping[str, Any], metadata)
@@ -877,7 +1056,11 @@ def run_check(
         )
 
     check = config["checks"][check_id]
-    command = list(check["command"])
+    execution_limits = config["limits"]["checks"]
+    timeout_seconds = execution_limits["timeout_seconds"]
+    max_output_bytes_per_stream = execution_limits["max_output_bytes_per_stream"]
+    configured_command = list(check["command"])
+    command = list(configured_command)
     if check["pass_criteria"] != "exit_code == 0":
         source = source_provenance(root)
         evidence = _record_result(
@@ -904,6 +1087,8 @@ def run_check(
         relative_spec = spec_dir.expanduser().resolve(strict=True).relative_to(root)
     except (OSError, RuntimeError, ValueError) as error:
         raise CheckError("approved spec directory is outside the repository") from error
+    spec_argument = relative_spec.as_posix()
+    command = [argument.replace("{spec_dir}", spec_argument) for argument in command]
 
     with _pinned_worktree(
         root,
@@ -985,15 +1170,13 @@ def run_check(
             command, str(config["toolchain"]["package_manager"]), check_root
         )
         try:
-            completed = subprocess.run(
+            completed = _run_bounded_check_command(
                 command,
-                cwd=check_root,
-                capture_output=True,
-                check=False,
-                text=True,
-                errors="replace",
+                check_root,
+                timeout_seconds=timeout_seconds,
+                max_output_bytes_per_stream=max_output_bytes_per_stream,
             )
-        except OSError as error:
+        except (OSError, CheckError) as error:
             evidence = _record_result(
                 record,
                 candidate_id,
@@ -1027,38 +1210,57 @@ def run_check(
             after_manifest != candidate["manifest"]
             or _git(check_root, "rev-parse", "HEAD") != pinned_commit
         )
-        outcome = (
-            "inconclusive"
-            if candidate_changed
-            else "pass"
-            if completed.returncode == 0
-            else "fail"
-        )
-        summary = (
-            f"candidate snapshot changed while check {check_id} was running"
-            if candidate_changed
-            else f"check {check_id} exited with code {completed.returncode}"
-        )
+        if (
+            candidate_changed
+            or completed["timed_out"]
+            or completed["capture_incomplete"]
+        ):
+            outcome = "inconclusive"
+        elif completed["returncode"] == 0:
+            outcome = "pass"
+        else:
+            outcome = "fail"
+
+        if candidate_changed:
+            summary = f"candidate snapshot changed while check {check_id} was running"
+        elif completed["timed_out"]:
+            summary = f"check {check_id} timed out after {timeout_seconds} seconds"
+        elif completed["capture_incomplete"]:
+            summary = f"check {check_id} output capture did not complete"
+        else:
+            summary = f"check {check_id} exited with code {completed['returncode']}"
         metadata = {
             "candidate_id": candidate_id,
             "check_id": check_id,
-            "command": command,
+            "configured_command": configured_command,
+            "executed_command": command,
             "config_digest": _canonical_digest(config),
             "check_definition_digest": _canonical_digest(check),
             "source_commit": source["commit"],
             "pinned_commit": pinned_commit,
             "pinned_tree": pinned_tree,
             "spec_dir": relative_spec.as_posix(),
-            "exit_code": completed.returncode,
+            "exit_code": completed["returncode"],
+            "timeout_seconds": timeout_seconds,
+            "max_output_bytes_per_stream": max_output_bytes_per_stream,
+            "timed_out": completed["timed_out"],
+            "capture_incomplete": completed["capture_incomplete"],
+            "lingering_output_process": completed["lingering_output_process"],
+            "stdout_truncated": completed["stdout_truncated"],
+            "stderr_truncated": completed["stderr_truncated"],
         }
         output = (
             OUTPUT_METADATA_PREFIX
             + json.dumps(metadata, sort_keys=True)
             + "\n[stdout]\n"
-            + completed.stdout
+            + completed["stdout"]
         )
-        if completed.stderr:
-            output += f"\n[stderr]\n{completed.stderr}"
+        if completed["stdout_truncated"]:
+            output += f"\n[stdout truncated at {max_output_bytes_per_stream} bytes]"
+        if completed["stderr"]:
+            output += f"\n[stderr]\n{completed['stderr']}"
+        if completed["stderr_truncated"]:
+            output += f"\n[stderr truncated at {max_output_bytes_per_stream} bytes]"
         output_bytes = output.encode("utf-8", errors="replace")
         try:
             artifact = _write_output_artifact(
@@ -1079,7 +1281,7 @@ def run_check(
                 "check_id": check_id,
                 "candidate_id": candidate_id,
                 "outcome": "unavailable",
-                "exit_code": completed.returncode,
+                "exit_code": completed["returncode"],
                 "summary": evidence["summary"],
                 "evidence_id": evidence["id"],
             }
@@ -1099,7 +1301,7 @@ def run_check(
             "check_id": check_id,
             "candidate_id": candidate_id,
             "outcome": outcome,
-            "exit_code": completed.returncode,
+            "exit_code": completed["returncode"],
             "summary": summary,
             "evidence_id": evidence["id"],
         }

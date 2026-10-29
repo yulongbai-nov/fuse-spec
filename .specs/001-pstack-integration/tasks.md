@@ -74,8 +74,9 @@
     - Ensure ordinary non-managed reconciliation retains its current behavior and the managed path cannot create a parallel acceptance rule.
 
 - [ ] T9 Add shared CI/check entry points, end-to-end scenarios, and user documentation  [id:T9 deps:T1,T2,T4,T5,T6,T7,T8 impl:R1,R2,R3,R4,R5,R6,R7,R8,D-Coordinator,D-RunControl,D-PRIntegration,D-Verification]
-    - **Files:** `.github/workflows/`, `.fuse/config.toml`, `README.md`, `tests/`
+    - **Files:** `.github/workflows/`, `.fuse/config.toml`, `schemas/project-config.schema.json`, `skills/scripts/fuse_candidate.py`, `skills/scripts/fuse_checks.py`, `commands/reconcile-spec.md`, `README.md`, `docs/user-guide.md`, `tests/`
     - Add end-to-end local-repository scenarios for a feature, bug fix, launch from outside the plugin root into a consuming repo, resume after an uncertain launch, forgotten verification, stale evidence, unavailable tools, review repair/carry-forward, and blocked work alongside unrelated progress.
     - Configure CI to invoke the same project-owned check entry point and definitions as local Fuse execution. Keep only provisioning, credentials, triggers, caching, and artifact transport specific to the workflow environment.
+    - Use one shared positive-integer timeout and per-stream output-capture cap from `.fuse/config.toml` for configured checks and locked tool restoration. Terminate timed-out process groups where supported; record timeout and truncated-output metadata with candidate-bound evidence, and never treat timeouts or incomplete captures as passing.
     - Document setup, supported Python version, configuration, command usage, state-ref recovery, Codex capability limits, routes, evidence gates, and clear unverified/blocked outcomes. Keep full transcripts and unrelated work outside the run record.
     - Run traceability, dependency planning, all project checks, and the task-, integrated-PR-, and whole-codebase review levels. Resolve findings within their configured maximum of two rounds per level before merge.

@@ -9,14 +9,13 @@ from graphlib import CycleError, TopologicalSorter
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from plan_waves import parse_tag
+    from plan_waves import parse_task_declarations
 else:
     try:
-        from .plan_waves import parse_tag
+        from .plan_waves import parse_task_declarations
     except ImportError:
-        from plan_waves import parse_tag
+        from plan_waves import parse_task_declarations
 
-TASK_TAG = re.compile(r"\[([^\]]*\bid:[^\]]*)\]")
 TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 CHECK_ID = re.compile(r"^[a-z][a-z0-9_-]*$")
 
@@ -27,27 +26,10 @@ class GraphError(ValueError):
 
 def parse_task_dependencies(tasks_markdown: str) -> dict[str, list[str]]:
     """Read task IDs and dependencies without treating checkboxes as acceptance."""
-    graph: dict[str, list[str]] = {}
-    duplicates: set[str] = set()
-    in_fence = False
-    for line in tasks_markdown.splitlines():
-        if line.lstrip().startswith("```"):
-            in_fence = not in_fence
-            continue
-        if in_fence:
-            continue
-        match = TASK_TAG.search(line)
-        if match is None:
-            continue
-        task_id, dependencies, _ = parse_tag(match.group(1))
-        if not task_id:
-            continue
-        if task_id in graph:
-            duplicates.add(task_id)
-            continue
-        graph[task_id] = dependencies
+    declarations, duplicates, _done = parse_task_declarations(tasks_markdown)
     if duplicates:
         raise GraphError("duplicate task id " + ", ".join(sorted(duplicates)))
+    graph = {task_id: task["deps"] for task_id, task in declarations.items()}
     return validate_dependency_graph(graph, "task")
 
 

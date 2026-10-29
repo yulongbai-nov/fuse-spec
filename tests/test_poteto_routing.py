@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 import sys
+import tomllib
 from pathlib import Path
 from typing import Any, cast
 
@@ -109,27 +110,49 @@ def test_conditional_routes_carry_their_required_evidence() -> None:
     assert by_method["Visual Parity"]["requires_exact_visual_requirement"] is True
 
 
-def test_requirement_model_defaults_match_the_latest_role_policy() -> None:
+def test_role_defaults_have_one_spec_source_and_match_project_config() -> None:
     requirements = (
         ROOT / ".specs" / "001-pstack-integration" / "requirements.md"
     ).read_text(encoding="utf-8")
     r7 = requirements.split("### R7: Choose suitable workers and models", 1)[1].split(
         "### R8:", 1
     )[0]
-    clauses = {
-        line.split(". ", 1)[0]: line
-        for line in r7.splitlines()
-        if line[:2] in {"4.", "5.", "6.", "7."}
+    expected = {
+        "manager": ("Latest Astra available to the host", "Max"),
+        "worker": ("Latest Luna available to the host", "Max"),
+        "reviewer": ("Latest Luna available to the host", "Max"),
+        "rca": ("Latest Luna available to the host", "Max"),
+        "rca_reviewer": ("Latest Luna available to the host", "Max"),
     }
+    table_headers = [
+        line
+        for line in r7.splitlines()
+        if line.strip() == "| Role profile | Initial model preference | Reasoning |"
+    ]
+    assert len(table_headers) == 1
+    table_rows = {}
+    for line in r7.splitlines():
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if len(cells) == 3 and cells[0] in expected:
+            table_rows[cells[0]] = (cells[1], cells[2])
+    assert table_rows == expected
 
-    assert "latest Luna" in clauses["4"] and "Max reasoning" in clauses["4"]
-    assert "latest Astra" in clauses["4"] and "manager" in clauses["4"]
-    assert "latest Luna" in clauses["5"] and "Max reasoning" in clauses["5"]
-    assert "latest Luna" in clauses["6"] and "Max reasoning" in clauses["6"]
-    assert "latest Luna" in clauses["7"] and "Max reasoning" in clauses["7"]
-    assert "latest Sol" not in clauses["6"]
-    assert "SHALL assign Astra with Max" not in clauses["4"]
-    assert "separate Astra agent" not in clauses["7"]
+    config = tomllib.loads((ROOT / ".fuse" / "config.toml").read_text(encoding="utf-8"))
+    configured = {
+        role: (profile["model"], profile["reasoning_effort"])
+        for role, profile in config["roles"].items()
+    }
+    assert configured == {
+        "manager": ("latest-astra", "max"),
+        "worker": ("latest-luna", "max"),
+        "reviewer": ("latest-luna", "max"),
+        "rca": ("latest-luna", "max"),
+        "rca_reviewer": ("latest-luna", "max"),
+    }
+    assert (
+        "Every model, reasoning setting, and resource limit remains configurable" in r7
+    )
+    assert "subject to host and configured budget availability" in r7
     assert "Luna Max does not imply unlimited usage" in r7
 
 

@@ -28,7 +28,7 @@
     },
     "limits": {
       "type": "object",
-      "required": ["review", "rca", "concurrency"],
+      "required": ["review", "rca", "concurrency", "checks"],
       "properties": {
         "review": {
           "type": "object",
@@ -58,6 +58,21 @@
           "properties": {
             "ordinary_luna_max_floor": { "type": "integer", "minimum": 1 },
             "other_profile_default": { "type": "integer", "minimum": 1 }
+          },
+          "additionalProperties": false
+        },
+        "checks": {
+          "type": "object",
+          "required": ["timeout_seconds", "max_output_bytes_per_stream"],
+          "properties": {
+            "timeout_seconds": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "max_output_bytes_per_stream": {
+              "type": "integer",
+              "minimum": 1
+            }
           },
           "additionalProperties": false
         }

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 import copy
 import json
 import shutil
@@ -21,7 +22,9 @@ import fuse_checks  # noqa: E402
 import fuse_cli  # noqa: E402
 import fuse_config  # noqa: E402
 import fuse_control  # noqa: E402
+import fuse_graph  # noqa: E402
 import fuse_launch  # noqa: E402
+import fuse_reconcile  # noqa: E402
 import fuse_record  # noqa: E402
 import fuse_state  # noqa: E402
 
@@ -252,15 +255,16 @@ class GateScenario:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
+        tasks: str | None = None,
     ) -> None:
-        self.root, self.spec = make_project(
-            tmp_path,
+        default_tasks = (
             "# Tasks\n\n"
             "- [ ] T1 Work [id:T1 deps: impl:R1,D-Test]\n"
             "- [ ] T2 Dependent [id:T2 deps:T1 impl:R1,D-Test]\n"
             "- [ ] T3 Independent [id:T3 deps: impl:R1,D-Test]\n"
-            "- [ ] T4 Independent [id:T4 deps: impl:R1,D-Test]\n",
+            "- [ ] T4 Independent [id:T4 deps: impl:R1,D-Test]\n"
         )
+        self.root, self.spec = make_project(tmp_path, tasks or default_tasks)
         self.monkeypatch = monkeypatch
         self.capsys = capsys
         self.check_outcome = "pass"
@@ -2741,3 +2745,775 @@ def test_review_replay_is_rejected_and_reopened_normalized_finding_keeps_id(
     )
     assert exhausted_rca.returncode != 0
     assert payload(exhausted_rca)["reason"] == "rca_limit_exhausted"
+
+
+def test_managed_reconcile_projects_checkboxes_from_validated_record_only(
+    gate_scenario: GateScenario,
+) -> None:
+    scenario = gate_scenario
+    scenario.accepted()
+    tasks_path = scenario.spec / "tasks.md"
+    original = tasks_path.read_text(encoding="utf-8")
+    altered = original.replace("- [ ] T2 Dependent", "- [x] T2 Dependent", 1)
+    assert altered != original
+    tasks_path.write_text(altered, encoding="utf-8")
+
+    report = fuse_reconcile.build_report(
+        scenario.root, scenario.spec, run_id=scenario.run_id
+    )
+    t1_gate = next(
+        row for row in report["task_acceptance_gates"] if row["task_id"] == "T1"
+    )
+    assert report["accepted_task_ids"] == ["T1"]
+    assert report["checked_but_unaccepted_task_ids"] == ["T2"]
+    assert report["accepted_but_unchecked_task_ids"] == ["T1"]
+    assert t1_gate["record_status"] == "accepted"
+    assert (
+        t1_gate["accepted_candidate_id"]
+        == scenario.record()["tasks"]["T1"]["accepted_candidate_id"]
+    )
+    assert t1_gate["accepted_candidate_is_current"] is True
+    assert t1_gate["gate_allowed"] is True
+
+    assert (
+        fuse_reconcile.main(
+            [
+                "--repo-root",
+                str(scenario.root),
+                "--spec-dir",
+                str(scenario.spec),
+                "--run-id",
+                scenario.run_id,
+                "--sync-task-checkboxes",
+            ]
+        )
+        == 0
+    )
+    projection = json.loads(scenario.capsys.readouterr().out)
+    assert projection["projected_task_ids"] == ["T1", "T2"]
+    lines = tasks_path.read_text(encoding="utf-8").splitlines()
+    assert lines[2].startswith("- [x] T1 Work")
+    assert lines[3].startswith("- [ ] T2 Dependent")
+    saved = scenario.record()
+    assert fuse_graph.accepted_task_ids(saved) == ["T1"]
+    assert "T2" not in saved["tasks"]
+
+
+def test_managed_reconcile_reports_unmanaged_mode_without_touching_spec(
+    tmp_path: Path,
+) -> None:
+    root, spec_dir = make_project(tmp_path)
+    before = (spec_dir / "tasks.md").read_bytes()
+
+    report = fuse_reconcile.build_report(root, spec_dir)
+
+    assert report["mode"] == "unmanaged"
+    assert (spec_dir / "tasks.md").read_bytes() == before
+
+
+def test_managed_reconcile_reports_changed_spec_and_blocks_projection(
+    tmp_path: Path,
+) -> None:
+    root, spec_dir = make_project(tmp_path)
+    run_id = initialized_run(root, spec_dir)
+    tasks_path = spec_dir / "tasks.md"
+    tasks_path.write_text(
+        tasks_path.read_text(encoding="utf-8").replace("T1 Work", "T1 Changed intent"),
+        encoding="utf-8",
+    )
+    before = tasks_path.read_bytes()
+
+    report = fuse_reconcile.build_report(root, spec_dir, run_id=run_id)
+
+    assert report["changed_spec_files"] == ["tasks.md"]
+    with pytest.raises(
+        fuse_reconcile.ReconcileError, match="approved_spec_inputs_changed"
+    ):
+        fuse_reconcile._project_checkboxes(
+            root, spec_dir, report["accepted_task_ids"], report
+        )
+    assert tasks_path.read_bytes() == before
+
+
+def test_managed_reconcile_reports_specific_missing_acceptance_evidence(
+    tmp_path: Path,
+) -> None:
+    root, spec_dir = make_project(tmp_path)
+    run_id = initialized_run(root, spec_dir)
+    finish_assignment(root, spec_dir, run_id, "T1", "Feature", "worker", "worker-1")
+
+    report = fuse_reconcile.build_report(root, spec_dir, run_id=run_id)
+
+    gate = report["task_acceptance_gates"][0]
+    assert gate["task_id"] == "T1"
+    assert gate["gate_allowed"] is False
+    assert gate["gate_reason"] == "check_evidence_missing"
+    assert gate["gate_details"]["check_id"]
+
+
+def test_managed_reconcile_reports_out_of_band_code_and_missing_artifacts(
+    tmp_path: Path,
+) -> None:
+    root, spec_dir = make_project(tmp_path)
+    run_id = initialized_run(root, spec_dir)
+    record = fuse_state.load_run(root, run_id)
+    prior_candidate = record["candidates"][0]["candidate_id"]
+    record["tasks"]["T1"] = {
+        "status": "accepted",
+        "assignment_ids": [],
+        "accepted_candidate_id": prior_candidate,
+    }
+    evidence = fuse_record.add_evidence(
+        record,
+        prior_candidate,
+        "check",
+        "pass",
+        "verified before the code changed",
+        check_id="tests",
+        artifacts=[
+            {
+                "path": "artifacts/checks/missing.txt",
+                "sha256": "0" * 64,
+                "required": True,
+            }
+        ],
+    )
+    fuse_state.save_run(root, record)
+    (root / "app.py").write_text("value = 2\n", encoding="utf-8")
+
+    report = fuse_reconcile.build_report(root, spec_dir, run_id=run_id)
+
+    assert report["candidate_is_recorded"] is False
+    assert report["accepted_tasks_on_stale_candidate"] == ["T1"]
+    assert evidence["id"] in report["stale_or_unavailable_evidence_ids"]
+
+
+def test_managed_reconcile_refuses_to_project_stale_acceptance(
+    gate_scenario: GateScenario,
+) -> None:
+    scenario = gate_scenario
+    scenario.accepted()
+    tasks_path = scenario.spec / "tasks.md"
+    before = tasks_path.read_bytes()
+    (scenario.root / "app.py").write_text("value = 2\n", encoding="utf-8")
+
+    report = fuse_reconcile.build_report(
+        scenario.root, scenario.spec, run_id=scenario.run_id
+    )
+
+    assert report["accepted_tasks_on_stale_candidate"] == ["T1"]
+    assert report["accepted_tasks_need_current_evidence"] == ["T1"]
+    assert (
+        fuse_reconcile.main(
+            [
+                "--repo-root",
+                str(scenario.root),
+                "--spec-dir",
+                str(scenario.spec),
+                "--run-id",
+                scenario.run_id,
+                "--sync-task-checkboxes",
+            ]
+        )
+        == 2
+    )
+    failure = json.loads(scenario.capsys.readouterr().out)
+    assert "accepted_tasks_need_current_evidence" in failure["message"]
+    assert tasks_path.read_bytes() == before
+    assert scenario.record()["tasks"]["T1"]["status"] == "accepted"
+
+
+@pytest.mark.parametrize("changed_input", ["requirements.md", "design.md", "tasks.md"])
+def test_managed_reconcile_refuses_candidate_changed_after_report(
+    gate_scenario: GateScenario, changed_input: str
+) -> None:
+    scenario = gate_scenario
+    scenario.accepted()
+    report = fuse_reconcile.build_report(
+        scenario.root, scenario.spec, run_id=scenario.run_id
+    )
+    changed_path = scenario.spec / changed_input
+    original = changed_path.read_text(encoding="utf-8")
+    if changed_input == "tasks.md":
+        updated = original.replace("T1 Work", "T1 Work with changed intent", 1)
+        assert updated != original
+    else:
+        updated = original + "\nApproved input changed after the report.\n"
+    changed_path.write_text(updated, encoding="utf-8")
+    changed_bytes = changed_path.read_bytes()
+
+    with pytest.raises(
+        fuse_reconcile.ReconcileError, match="approved spec or policy candidate changed"
+    ):
+        fuse_reconcile._project_checkboxes(
+            scenario.root, scenario.spec, report["accepted_task_ids"], report
+        )
+
+    assert changed_path.read_bytes() == changed_bytes
+    assert scenario.record()["tasks"]["T1"]["status"] == "accepted"
+
+
+def test_managed_reconcile_allows_checkbox_only_changes_after_report(
+    gate_scenario: GateScenario,
+) -> None:
+    scenario = gate_scenario
+    scenario.accepted()
+    report = fuse_reconcile.build_report(
+        scenario.root, scenario.spec, run_id=scenario.run_id
+    )
+    tasks_path = scenario.spec / "tasks.md"
+    tasks_path.write_text(
+        tasks_path.read_text(encoding="utf-8").replace(
+            "- [ ] T2 Dependent", "- [x] T2 Dependent", 1
+        ),
+        encoding="utf-8",
+    )
+
+    changed = fuse_reconcile._project_checkboxes(
+        scenario.root, scenario.spec, report["accepted_task_ids"], report
+    )
+
+    assert changed == ["T1", "T2"]
+    projected = tasks_path.read_text(encoding="utf-8")
+    assert "- [x] T1 Work" in projected
+    assert "- [ ] T2 Dependent" in projected
+
+
+def test_managed_reconcile_preserves_task_text_changed_at_write_boundary(
+    gate_scenario: GateScenario,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = gate_scenario
+    scenario.accepted()
+    report = fuse_reconcile.build_report(
+        scenario.root, scenario.spec, run_id=scenario.run_id
+    )
+    tasks_path = scenario.spec / "tasks.md"
+    original_writer = fuse_reconcile._write_checkbox_projection
+
+    def edit_intent_then_write(path: Path, accepted_task_ids: list[str]) -> list[str]:
+        text = path.read_text(encoding="utf-8")
+        updated = text.replace("T1 Work", "T1 Concurrently changed intent", 1)
+        assert updated != text
+        path.write_text(updated, encoding="utf-8")
+        return original_writer(path, accepted_task_ids)
+
+    monkeypatch.setattr(
+        fuse_reconcile, "build_report", lambda *_args, **_kwargs: report
+    )
+    monkeypatch.setattr(
+        fuse_reconcile, "_write_checkbox_projection", edit_intent_then_write
+    )
+
+    status = fuse_reconcile.main(
+        [
+            "--repo-root",
+            str(scenario.root),
+            "--spec-dir",
+            str(scenario.spec),
+            "--run-id",
+            scenario.run_id,
+            "--sync-task-checkboxes",
+        ]
+    )
+
+    assert status == 2
+    failure = json.loads(scenario.capsys.readouterr().out)
+    assert "stale checkbox projection detected after writing" in failure["message"]
+    assert "projected_task_ids" not in failure
+    assert "- [x] T1 Concurrently changed intent" in tasks_path.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_managed_reconcile_recomputes_checkbox_offset_after_same_inode_insert(
+    gate_scenario: GateScenario,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = gate_scenario
+    scenario.accepted()
+    report = fuse_reconcile.build_report(
+        scenario.root, scenario.spec, run_id=scenario.run_id
+    )
+    tasks_path = scenario.spec / "tasks.md"
+    original_parser = fuse_reconcile._checkbox_projection_updates
+    calls = 0
+    original_inode = tasks_path.stat().st_ino
+
+    def insert_before_stale_offset(
+        content: bytes, accepted_task_ids: set[str]
+    ) -> tuple[dict[str, tuple[int, bytes]], int]:
+        nonlocal calls
+        calls += 1
+        updates = original_parser(content, accepted_task_ids)
+        if calls == 2:
+            with tasks_path.open("r+b") as stream:
+                current = stream.read()
+                stream.seek(0)
+                stream.write(b"EXTRA\n" + current)
+                stream.truncate()
+                stream.flush()
+        return updates
+
+    monkeypatch.setattr(
+        fuse_reconcile, "_checkbox_projection_updates", insert_before_stale_offset
+    )
+    monkeypatch.setattr(
+        fuse_reconcile, "build_report", lambda *_args, **_kwargs: report
+    )
+
+    status = fuse_reconcile.main(
+        [
+            "--repo-root",
+            str(scenario.root),
+            "--spec-dir",
+            str(scenario.spec),
+            "--run-id",
+            scenario.run_id,
+            "--sync-task-checkboxes",
+        ]
+    )
+
+    assert status == 2
+    failure = json.loads(scenario.capsys.readouterr().out)
+    assert "stale checkbox projection detected after writing" in failure["message"]
+    assert tasks_path.stat().st_ino == original_inode
+    projected = tasks_path.read_text(encoding="utf-8")
+    assert projected.startswith("EXTRA\n# Tasks\n")
+    assert "# Tasks\n" in projected
+    assert "EXTRA" not in projected.splitlines()[1]
+    assert "- [x] T1 Work" in projected
+    assert "- [ ] T2 Dependent" in projected
+
+
+def test_managed_reconcile_rechecks_after_parser_before_same_inode_write(
+    gate_scenario: GateScenario,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = gate_scenario
+    scenario.accepted()
+    report = fuse_reconcile.build_report(
+        scenario.root, scenario.spec, run_id=scenario.run_id
+    )
+    tasks_path = scenario.spec / "tasks.md"
+    original_parser = fuse_reconcile._checkbox_projection_updates
+    calls = 0
+    original_inode = tasks_path.stat().st_ino
+
+    def insert_after_stale_offsets_are_parsed(
+        content: bytes, accepted_task_ids: set[str]
+    ) -> tuple[dict[str, tuple[int, bytes]], int]:
+        nonlocal calls
+        calls += 1
+        updates = original_parser(content, accepted_task_ids)
+        if calls == 3:
+            with tasks_path.open("r+b") as stream:
+                current = stream.read()
+                stream.seek(0)
+                stream.write(b"EXTRA\n" + current)
+                stream.truncate()
+                stream.flush()
+        return updates
+
+    monkeypatch.setattr(
+        fuse_reconcile,
+        "_checkbox_projection_updates",
+        insert_after_stale_offsets_are_parsed,
+    )
+    monkeypatch.setattr(
+        fuse_reconcile, "build_report", lambda *_args, **_kwargs: report
+    )
+
+    status = fuse_reconcile.main(
+        [
+            "--repo-root",
+            str(scenario.root),
+            "--spec-dir",
+            str(scenario.spec),
+            "--run-id",
+            scenario.run_id,
+            "--sync-task-checkboxes",
+        ]
+    )
+
+    assert status == 2
+    failure = json.loads(scenario.capsys.readouterr().out)
+    assert "stale checkbox projection detected after writing" in failure["message"]
+    assert calls >= 5
+    assert tasks_path.stat().st_ino == original_inode
+    projected = tasks_path.read_text(encoding="utf-8")
+    assert projected.startswith("EXTRA\n# Tasks\n")
+    assert "# Tasks\n" in projected
+    assert "- [x] T1 Work" in projected
+    assert "- [ ] T2 Dependent" in projected
+
+
+def test_checkbox_projection_reports_missing_posix_lock_support(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tasks_path = tmp_path / "tasks.md"
+    original = "# Tasks\n\n- [ ] T1 Work [id:T1 deps: impl:R1,D-Test]\n"
+    tasks_path.write_text(original, encoding="utf-8")
+    real_import = builtins.__import__
+
+    def without_fcntl(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "fcntl":
+            raise ImportError("simulated platform without fcntl")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", without_fcntl)
+
+    with pytest.raises(fuse_reconcile.ReconcileError, match="requires POSIX fcntl"):
+        fuse_reconcile._write_checkbox_projection(tasks_path, ["T1"])
+
+    assert tasks_path.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.parametrize(
+    ("opening", "closing"),
+    [("```markdown", "````"), ("~~~markdown", "~~~~")],
+)
+def test_managed_reconcile_does_not_project_fenced_task_examples(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    opening: str,
+    closing: str,
+) -> None:
+    fenced_example = "- [x] T9 Example [id:T9 deps: impl:R1,D-Test]\n"
+    tasks = (
+        "# Tasks\n\n"
+        "- [ ] T1 Work [id:T1 deps: impl:R1,D-Test]\n\n"
+        f"{opening}\n"
+        f"{fenced_example}"
+        f"{closing}\n"
+    )
+    scenario = GateScenario(tmp_path, monkeypatch, capsys, tasks=tasks)
+    scenario.accepted()
+
+    status = fuse_reconcile.main(
+        [
+            "--repo-root",
+            str(scenario.root),
+            "--spec-dir",
+            str(scenario.spec),
+            "--run-id",
+            scenario.run_id,
+            "--sync-task-checkboxes",
+        ]
+    )
+
+    assert status == 0
+    scenario.capsys.readouterr()
+    projected = (scenario.spec / "tasks.md").read_text(encoding="utf-8")
+    assert "- [x] T1 Work" in projected
+    assert f"{opening}\n{fenced_example}{closing}\n" in projected
+
+
+def test_managed_reconcile_does_not_project_list_nested_fenced_task_example(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fenced_example = "    - [x] T9 Example [id:T9 deps: impl:R1,D-Test]\n"
+    tasks = (
+        "# Tasks\n\n"
+        "- [ ] T1 Work [id:T1 deps: impl:R1,D-Test]\n"
+        "    - T2 nested detail without an ID\n"
+        "    ~~~markdown\n"
+        f"{fenced_example}"
+        "    ~~~~\n"
+        "> ```markdown\n"
+        "> - [x] T8 Quoted example [id:T8 deps: impl:R1,D-Test]\n"
+        "> ```\n"
+    )
+    scenario = GateScenario(tmp_path, monkeypatch, capsys, tasks=tasks)
+    scenario.accepted()
+
+    status = fuse_reconcile.main(
+        [
+            "--repo-root",
+            str(scenario.root),
+            "--spec-dir",
+            str(scenario.spec),
+            "--run-id",
+            scenario.run_id,
+            "--sync-task-checkboxes",
+        ]
+    )
+
+    assert status == 0
+    scenario.capsys.readouterr()
+    projected = (scenario.spec / "tasks.md").read_text(encoding="utf-8")
+    assert "- [x] T1 Work" in projected
+    assert "    - T2 nested detail without an ID" in projected
+    assert f"    ~~~markdown\n{fenced_example}    ~~~~\n" in projected
+    assert "> - [x] T8 Quoted example [id:T8" in projected
+
+
+def test_managed_reconcile_projects_crlf_task_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    tasks = "# Tasks\r\n\r\n- [ ] T1 Work [id:T1 deps: impl:R1,D-Test]\r\n"
+    scenario = GateScenario(tmp_path, monkeypatch, capsys, tasks=tasks)
+    scenario.accepted()
+
+    status = fuse_reconcile.main(
+        [
+            "--repo-root",
+            str(scenario.root),
+            "--spec-dir",
+            str(scenario.spec),
+            "--run-id",
+            scenario.run_id,
+            "--sync-task-checkboxes",
+        ]
+    )
+
+    assert status == 0
+    scenario.capsys.readouterr()
+    projected = (scenario.spec / "tasks.md").read_bytes()
+    assert b"# Tasks\r\n\r\n" in projected
+    assert b"- [x] T1 Work [id:T1 deps: impl:R1,D-Test]\r\n" in projected
+
+
+def test_managed_reconcile_reports_stale_projection_after_local_state_race(
+    gate_scenario: GateScenario,
+) -> None:
+    scenario = gate_scenario
+    scenario.accepted()
+    tasks_path = scenario.spec / "tasks.md"
+    original_writer = fuse_reconcile._write_checkbox_projection
+    mutated = False
+
+    def write_then_block_task(path: Path, accepted_task_ids: list[str]) -> list[str]:
+        nonlocal mutated
+        projected = original_writer(path, accepted_task_ids)
+        if path != tasks_path or mutated:
+            return projected
+        mutated = True
+        record = scenario.record()
+        record["tasks"]["T1"]["status"] = "blocked"
+        record["tasks"]["T1"]["accepted_candidate_id"] = None
+        fuse_state.save_run(scenario.root, record)
+        return projected
+
+    scenario.monkeypatch.setattr(
+        fuse_reconcile, "_write_checkbox_projection", write_then_block_task
+    )
+
+    status = fuse_reconcile.main(
+        [
+            "--repo-root",
+            str(scenario.root),
+            "--spec-dir",
+            str(scenario.spec),
+            "--run-id",
+            scenario.run_id,
+            "--sync-task-checkboxes",
+        ]
+    )
+
+    assert status == 2
+    failure = json.loads(scenario.capsys.readouterr().out)
+    assert "stale checkbox projection detected after writing" in failure["message"]
+    assert "rerun /reconcile-spec immediately" in failure["message"]
+    assert "projected_task_ids" not in failure
+    assert scenario.record()["tasks"]["T1"]["status"] == "blocked"
+    assert "- [x] T1 Work" in tasks_path.read_text(encoding="utf-8")
+
+
+def test_managed_reconcile_reports_stale_projection_after_remote_state_race(
+    gate_scenario: GateScenario,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = gate_scenario
+    scenario.accepted()
+    record = scenario.record()
+    remote = tmp_path / "state-remote.git"
+    git(tmp_path, "init", "--bare", "--quiet", str(remote))
+    fuse_state.checkpoint_run(scenario.root, remote, record, expected_revision=None)
+    original_fetch = fuse_state._fetch_remote_state
+    original_writer = fuse_reconcile._write_checkbox_projection
+    after_write = False
+
+    def changed_after_replace(
+        repository_root: Path, remote_name: str | Path, spec_id: str, selected_run: str
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        revision, remote_record = original_fetch(
+            repository_root, remote_name, spec_id, selected_run
+        )
+        if after_write:
+            return "f" * 40, remote_record
+        return revision, remote_record
+
+    def mark_projection_written(path: Path, accepted_task_ids: list[str]) -> list[str]:
+        nonlocal after_write
+        changed = original_writer(path, accepted_task_ids)
+        if path == scenario.spec / "tasks.md":
+            after_write = True
+        return changed
+
+    monkeypatch.setattr(fuse_state, "_fetch_remote_state", changed_after_replace)
+    monkeypatch.setattr(
+        fuse_reconcile, "_write_checkbox_projection", mark_projection_written
+    )
+
+    status = fuse_reconcile.main(
+        [
+            "--repo-root",
+            str(scenario.root),
+            "--spec-dir",
+            str(scenario.spec),
+            "--run-id",
+            scenario.run_id,
+            "--remote",
+            str(remote),
+            "--sync-task-checkboxes",
+        ]
+    )
+
+    assert status == 2
+    failure = json.loads(scenario.capsys.readouterr().out)
+    assert "stale checkbox projection detected after writing" in failure["message"]
+    assert "canonical remote state changed" in failure["message"]
+    assert "projected_task_ids" not in failure
+    assert after_write is True
+
+
+def test_reconcile_spec_command_preserves_legacy_all_and_snapshot_guidance() -> None:
+    command = (REPOSITORY / "commands" / "reconcile-spec.md").read_text(
+        encoding="utf-8"
+    )
+
+    locked_plugin_run = (
+        'uv run --project "$PLUGIN_ROOT" --directory "$PLUGIN_ROOT" --locked'
+    )
+    assert "or reconcile all if requested" in command
+    assert "process each spec separately" in command
+    assert "non-authoritative snapshot" in command
+    assert "before final byte validation" in command
+    assert "immediately afterward" in command
+    assert "ensure no editor or other writer that ignores this lock" in command
+    assert "reports a stale snapshot if detected" in command
+    assert locked_plugin_run in command
+    assert 'python "$PLUGIN_ROOT/skills/scripts/fuse_reconcile.py"' in command
+    assert '--repo-root "$REPO_ROOT"' in command
+    assert '--spec-dir "$SPEC_DIR"' in command
+    assert 'python "$PLUGIN_ROOT/skills/scripts/sync_check.py" "$SPEC_DIR"' in command
+    assert (
+        'python "$PLUGIN_ROOT/skills/scripts/plan_waves.py" "$SPEC_DIR/tasks.md"'
+        in command
+    )
+    assert "python3 <plugin-root>/skills/scripts/" not in command
+
+
+def test_managed_reconcile_reports_changed_pr_heads_from_snapshot_and_remote(
+    tmp_path: Path,
+) -> None:
+    root, spec_dir = make_project(tmp_path)
+    run_id = initialized_run(root, spec_dir)
+    record = fuse_state.load_run(root, run_id)
+    recorded_pr = {
+        "task_id": "T1",
+        "provider": "github",
+        "repository": "example/repo",
+        "number": 7,
+        "base": "a" * 40,
+        "head": "b" * 40,
+    }
+    record["git"]["pull_requests"] = [recorded_pr]
+    fuse_state.save_run(root, record)
+    remote = tmp_path / "state-remote.git"
+    git(tmp_path, "init", "--bare", "--quiet", str(remote))
+    fuse_state.checkpoint_run(root, remote, record, expected_revision=None)
+
+    observed = [dict(recorded_pr, head="c" * 40)]
+    report = fuse_reconcile.build_report(
+        root, spec_dir, run_id=run_id, remote=str(remote), observed_prs=observed
+    )
+
+    assert report["pull_request_discrepancies"][0]["kind"] == "pr_head_or_base_changed"
+    assert report["remote_status"] == "present"
+    assert report["remote_pr_head_discrepancies"] == []
+
+    local = fuse_state.load_run(root, run_id)
+    local["git"]["pull_requests"][0]["head"] = "d" * 40
+    fuse_state.save_run(root, local)
+    conflicted = fuse_reconcile.build_report(
+        root, spec_dir, run_id=run_id, remote=str(remote)
+    )
+    assert conflicted["remote_reconciliation"]["status"] == "conflict"
+    assert (
+        conflicted["remote_pr_head_discrepancies"][0]["kind"]
+        == "pr_head_or_base_changed"
+    )
+
+
+def test_managed_reconcile_rechecks_remote_revision_before_projection(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, spec_dir = make_project(tmp_path)
+    run_id = initialized_run(root, spec_dir)
+    tasks_path = spec_dir / "tasks.md"
+    tasks_path.write_text(
+        tasks_path.read_text(encoding="utf-8").replace("- [ ] T1", "- [x] T1"),
+        encoding="utf-8",
+    )
+    record = fuse_state.load_run(root, run_id)
+    record["git"]["pull_requests"] = [
+        {
+            "task_id": "T1",
+            "provider": "github",
+            "repository": "example/repo",
+            "number": 7,
+            "base": "a" * 40,
+            "head": "b" * 40,
+        }
+    ]
+    fuse_state.save_run(root, record)
+    remote = tmp_path / "state-remote.git"
+    git(tmp_path, "init", "--bare", "--quiet", str(remote))
+    fuse_state.checkpoint_run(root, remote, record, expected_revision=None)
+    before = tasks_path.read_bytes()
+    original_fetch = fuse_state._fetch_remote_state
+    calls = 0
+
+    def changed_revision(
+        repository_root: Path, remote_name: str | Path, spec_id: str, selected_run: str
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        nonlocal calls
+        calls += 1
+        revision, remote_record = original_fetch(
+            repository_root, remote_name, spec_id, selected_run
+        )
+        if calls == 2:
+            return "f" * 40, remote_record
+        return revision, remote_record
+
+    monkeypatch.setattr(fuse_state, "_fetch_remote_state", changed_revision)
+
+    status = fuse_reconcile.main(
+        [
+            "--repo-root",
+            str(root),
+            "--spec-dir",
+            str(spec_dir),
+            "--run-id",
+            run_id,
+            "--remote",
+            str(remote),
+            "--sync-task-checkboxes",
+        ]
+    )
+
+    assert status == 2
+    failure = json.loads(capsys.readouterr().out)
+    assert "canonical remote state changed" in failure["message"]
+    assert calls == 2
+    assert tasks_path.read_bytes() == before

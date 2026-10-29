@@ -70,6 +70,17 @@ def test_task_readiness_uses_accepted_run_state_not_checkboxes() -> None:
     assert fuse_graph.ready_task_ids(task_graph, run_record) == ["T2", "T3"]
 
 
+def test_quoted_task_example_is_not_in_dependency_graph() -> None:
+    task_graph = fuse_graph.parse_task_dependencies(
+        "> ```markdown\n"
+        "> - [ ] T9 Example [id:T9 deps: impl:R1]\n"
+        "> ```\n"
+        "- [ ] T1 Real [id:T1 deps: impl:R1]\n"
+    )
+
+    assert task_graph == {"T1": []}
+
+
 def test_unresolved_assignment_blocks_only_its_task() -> None:
     task_graph: dict[str, list[str]] = {"T1": [], "T2": []}
     run_record = {

@@ -28,10 +28,17 @@ import re
 import sys
 from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path
-from typing import TypedDict
+from typing import TYPE_CHECKING, TypedDict
+
+if TYPE_CHECKING:
+    from fuse_markdown import markdown_fence_line_flags, task_checkbox_row_match
+else:
+    try:
+        from .fuse_markdown import markdown_fence_line_flags, task_checkbox_row_match
+    except ImportError:
+        from fuse_markdown import markdown_fence_line_flags, task_checkbox_row_match
 
 TASK_TAG = re.compile(r"\[([^\]]*\bid:[^\]]*)\]")
-DONE_RE = re.compile(r"^\s*-\s*\[[xX]\]")
 FILES_RE = re.compile(
     r"^\s*(?:[-*]\s*)?(?:\*\*)?Files:(?:\*\*)?\s*(.*)$", re.IGNORECASE
 )
@@ -184,14 +191,12 @@ def parse_task_declarations(
     done_ids: set[str] = set()
     invalid: set[str] = set()
     current_task_id: str | None = None
-    in_fence = False
-    for line in tasks_markdown.splitlines():
-        if line.lstrip().startswith("```"):
-            in_fence = not in_fence
-            continue
+    lines = tasks_markdown.splitlines()
+    for line, in_fence in zip(lines, markdown_fence_line_flags(lines), strict=True):
         if in_fence:
             continue
-        match = TASK_TAG.search(line)
+        checkbox_row = task_checkbox_row_match(line)
+        match = TASK_TAG.search(line) if checkbox_row is not None else None
         if match:
             task_id, dependencies, implementation = parse_tag(match.group(1))
             current_task_id = task_id
@@ -206,7 +211,7 @@ def parse_task_declarations(
                 "writes": [],
                 "scope_invalid": False,
             }
-            if DONE_RE.match(line):
+            if checkbox_row is not None and checkbox_row.group("status").lower() == "x":
                 done_ids.add(task_id)
             continue
         if current_task_id is None:

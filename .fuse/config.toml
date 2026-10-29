@@ -45,6 +45,10 @@ attempts_per_hard_blocker = 1
 ordinary_luna_max_floor = 5
 other_profile_default = 3
 
+[limits.checks]
+timeout_seconds = 1800
+max_output_bytes_per_stream = 1048576
+
 [budgets]
 elapsed_time_seconds = "unset"
 
@@ -56,6 +60,8 @@ unit = "tokens"
 allowed_fields = [
     "limits.concurrency.ordinary_luna_max_floor",
     "limits.concurrency.other_profile_default",
+    "limits.checks.timeout_seconds",
+    "limits.checks.max_output_bytes_per_stream",
     "limits.review.max_repair_rounds_per_level",
     "budgets.elapsed_time_seconds",
     "budgets.model_usage.limit",
@@ -64,6 +70,8 @@ allowed_fields = [
 [overrides.bounds]
 "limits.concurrency.ordinary_luna_max_floor" = { minimum = 1, value_type = "integer" }
 "limits.concurrency.other_profile_default" = { minimum = 1, value_type = "integer" }
+"limits.checks.timeout_seconds" = { minimum = 1, value_type = "integer" }
+"limits.checks.max_output_bytes_per_stream" = { minimum = 1, value_type = "integer" }
 "limits.review.max_repair_rounds_per_level" = { minimum = 0, maximum = 2, value_type = "integer" }
 "budgets.elapsed_time_seconds" = { minimum = 1, value_type = "integer" }
 "budgets.model_usage.limit" = { minimum = 1, value_type = "number" }
@@ -116,4 +124,16 @@ command = [
 ]
 prerequisites = []
 inputs = [".fuse/config.toml", "schemas/project-config.schema.json"]
+pass_criteria = "exit_code == 0"
+
+[checks.traceability]
+command = ["uv", "run", "--locked", "python", "skills/scripts/sync_check.py", "{spec_dir}"]
+prerequisites = []
+inputs = ["skills/scripts/sync_check.py"]
+pass_criteria = "exit_code == 0"
+
+[checks.planner]
+command = ["uv", "run", "--locked", "python", "skills/scripts/plan_waves.py", "{spec_dir}/tasks.md"]
+prerequisites = []
+inputs = ["skills/scripts/plan_waves.py"]
 pass_criteria = "exit_code == 0"

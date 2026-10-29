@@ -156,6 +156,12 @@ def test_tasks_checkbox_normalizer_only_changes_declared_task_checkboxes() -> No
 ```md
 - [x] Example [id:fake deps: impl:R1]
 ```
+> ```markdown
+> - [x] T8 Quoted example [id:T8 deps: impl:R1]
+> ```
+~~~md
+- [x] T9 Example [id:T9 deps: impl:R1]
+~~~
 """
 
     normalized = fuse_candidate.normalize_task_checkboxes(markdown)
@@ -163,3 +169,58 @@ def test_tasks_checkbox_normalizer_only_changes_declared_task_checkboxes() -> No
     assert "- [ ] T1 Complete" in normalized
     assert "  - [X] Nested checklist item" in normalized
     assert "- [x] Example [id:fake" in normalized
+    assert "> - [x] T8 Quoted example [id:T8" in normalized
+    assert "- [x] T9 Example [id:T9" in normalized
+
+
+def test_tasks_checkbox_normalizer_supports_crlf_task_rows() -> None:
+    markdown = "- [x] T1 Complete [id:T1 deps: impl:R1]\r\n"
+
+    normalized = fuse_candidate.normalize_task_checkboxes(markdown)
+
+    assert normalized == "- [ ] T1 Complete [id:T1 deps: impl:R1]\r\n"
+
+
+def test_tilde_fenced_task_content_affects_candidate_identity(
+    tmp_path: Path,
+) -> None:
+    root, spec_dir, config, policy = candidate_project(tmp_path)
+    tasks_path = spec_dir / "tasks.md"
+    initial_tasks = (
+        "# Tasks\n\n"
+        "- [ ] T1 Real [id:T1 deps: impl:R1,D-Core]\n\n"
+        "    - T2 nested detail without an ID\n"
+        "    ~~~markdown\n"
+        "    - [ ] T9 Example [id:T9 deps: impl:R1,D-Core]\n"
+        "    ~~~~\n"
+    )
+    tasks_path.write_text(initial_tasks, encoding="utf-8")
+
+    def identity() -> str:
+        record = fuse_record.new_run_record("001-demo", policy)
+        manifest = fuse_candidate.build_candidate_manifest(
+            root, spec_dir, policy, config
+        )
+        candidate = fuse_record.add_candidate(record, manifest)
+        candidate_id = candidate.get("candidate_id")
+        assert isinstance(candidate_id, str)
+        return candidate_id
+
+    original_identity = identity()
+    tasks_path.write_text(
+        initial_tasks.replace("- [ ] T1", "- [x] T1", 1), encoding="utf-8"
+    )
+    assert identity() == original_identity
+
+    tasks_with_checked_example = tasks_path.read_text(encoding="utf-8").replace(
+        "    - [ ] T9 Example", "    - [x] T9 Example", 1
+    )
+    tasks_path.write_text(tasks_with_checked_example, encoding="utf-8")
+    checked_example_identity = identity()
+    assert checked_example_identity != original_identity
+
+    tasks_with_changed_example = tasks_with_checked_example.replace(
+        "T9 Example", "T9 Changed Example", 1
+    )
+    tasks_path.write_text(tasks_with_changed_example, encoding="utf-8")
+    assert identity() != checked_example_identity

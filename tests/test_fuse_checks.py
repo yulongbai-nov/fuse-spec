@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import importlib
+import json
 import subprocess
 import sys
 import tomllib
@@ -191,6 +192,181 @@ def test_run_check_records_candidate_bound_command_and_output_artifact(
         )
         == evidence
     )
+
+
+def test_run_check_expands_spec_dir_in_configured_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, spec_dir, config, policy = check_project(tmp_path)
+    config["checks"]["tests"]["command"] = [
+        sys.executable,
+        "-c",
+        "import sys; print(sys.argv[1])",
+        "{spec_dir}",
+    ]
+    record, candidate = record_with_candidate(root, spec_dir, config, policy)
+    monkeypatch.setattr(
+        fuse_checks,
+        "prepare_toolchain",
+        lambda _root, _config: {
+            "ready": True,
+            "summary": "locked project environment ready",
+            "tool_versions": {"python": "3.11", "uv": "0.9"},
+        },
+    )
+
+    result = fuse_checks.run_check(
+        root, spec_dir, config, record, candidate["candidate_id"], "tests"
+    )
+
+    evidence = record["evidence"][-1]
+    artifact_root = root / ".fuse" / "runs" / record["run_id"]
+    artifact = artifact_root / evidence["artifacts"][0]["path"]
+    assert result["outcome"] == "pass"
+    content = artifact.read_bytes()
+    header, separator, output = content.partition(b"\n")
+    metadata = json.loads(
+        header[len(fuse_checks.OUTPUT_METADATA_PREFIX.encode("ascii")) :]
+    )
+    assert separator == b"\n"
+    assert metadata["configured_command"] == config["checks"]["tests"]["command"]
+    assert metadata["executed_command"] == [
+        sys.executable,
+        "-c",
+        "import sys; print(sys.argv[1])",
+        ".specs/001-demo",
+    ]
+    assert b"\n[stdout]\n.specs/001-demo\n" in content
+    assert (
+        fuse_checks.require_check_evidence(
+            record, "tests", candidate["candidate_id"], artifact_root, config
+        )
+        == evidence
+    )
+
+    for argv_field in ("configured_command", "executed_command"):
+        forged_metadata = json.loads(json.dumps(metadata))
+        forged_metadata[argv_field][-1] = ".specs/forged"
+        forged_content = (
+            fuse_checks.OUTPUT_METADATA_PREFIX.encode("ascii")
+            + json.dumps(forged_metadata, sort_keys=True).encode("utf-8")
+            + separator
+            + output
+        )
+        artifact.write_bytes(forged_content)
+        evidence["artifacts"][0]["sha256"] = hashlib.sha256(forged_content).hexdigest()
+        with pytest.raises(
+            fuse_checks.CheckError, match="execution metadata or provenance"
+        ):
+            fuse_checks.require_check_evidence(
+                record, "tests", candidate["candidate_id"], artifact_root, config
+            )
+
+
+def test_check_candidate_binds_shared_execution_limits(tmp_path: Path) -> None:
+    root, spec_dir, config, policy = check_project(tmp_path)
+    _record, candidate = record_with_candidate(root, spec_dir, config, policy)
+    verification = candidate["manifest"]["verification_inputs"]
+    assert verification["check_execution_limits"] == config["limits"]["checks"]
+
+    for limit in ("timeout_seconds", "max_output_bytes_per_stream"):
+        changed_config = copy.deepcopy(config)
+        changed_config["limits"]["checks"][limit] += 1
+        changed_manifest = fuse_candidate.build_candidate_manifest(
+            root, spec_dir, policy, changed_config
+        )
+        assert (
+            changed_manifest["verification_inputs"]["check_execution_limits"]
+            == changed_config["limits"]["checks"]
+        )
+        assert changed_manifest != candidate["manifest"]
+        with pytest.raises(fuse_checks.CheckError, match="execution limits are stale"):
+            fuse_checks._candidate_matches_config(candidate, changed_config)
+
+
+def test_run_check_bounds_captured_stdout_and_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, spec_dir, config, policy = check_project(tmp_path)
+    config["limits"]["checks"]["max_output_bytes_per_stream"] = 64
+    config["checks"]["tests"]["command"] = [
+        sys.executable,
+        "-c",
+        "import sys; sys.stdout.write('o' * 4096); sys.stderr.write('e' * 4096)",
+    ]
+    record, candidate = record_with_candidate(root, spec_dir, config, policy)
+    monkeypatch.setattr(
+        fuse_checks,
+        "prepare_toolchain",
+        lambda *_args: {"ready": True, "summary": "ready", "tool_versions": {}},
+    )
+
+    result = fuse_checks.run_check(
+        root, spec_dir, config, record, candidate["candidate_id"], "tests"
+    )
+
+    evidence = record["evidence"][-1]
+    artifact_root = root / ".fuse" / "runs" / record["run_id"]
+    artifact = artifact_root / evidence["artifacts"][0]["path"]
+    content = artifact.read_text(encoding="utf-8")
+    metadata = json.loads(
+        content.splitlines()[0][len(fuse_checks.OUTPUT_METADATA_PREFIX) :]
+    )
+    assert result["outcome"] == "pass"
+    assert metadata["timeout_seconds"] == config["limits"]["checks"]["timeout_seconds"]
+    assert metadata["max_output_bytes_per_stream"] == 64
+    assert metadata["capture_incomplete"] is False
+    assert metadata["stdout_truncated"] is True
+    assert metadata["stderr_truncated"] is True
+    assert "\n[stdout]\n" + "o" * 64 in content
+    assert "[stdout truncated at 64 bytes]" in content
+    assert "\n[stderr]\n" + "e" * 64 in content
+    assert "[stderr truncated at 64 bytes]" in content
+    assert (
+        fuse_checks.require_check_evidence(
+            record, "tests", candidate["candidate_id"], artifact_root, config
+        )
+        == evidence
+    )
+
+
+def test_run_check_timeout_is_bounded_and_never_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, spec_dir, config, policy = check_project(tmp_path)
+    config["limits"]["checks"]["timeout_seconds"] = 1
+    config["checks"]["tests"]["command"] = [
+        sys.executable,
+        "-c",
+        "import time; print('started', flush=True); time.sleep(10)",
+    ]
+    record, candidate = record_with_candidate(root, spec_dir, config, policy)
+    monkeypatch.setattr(
+        fuse_checks,
+        "prepare_toolchain",
+        lambda *_args: {"ready": True, "summary": "ready", "tool_versions": {}},
+    )
+
+    result = fuse_checks.run_check(
+        root, spec_dir, config, record, candidate["candidate_id"], "tests"
+    )
+
+    evidence = record["evidence"][-1]
+    artifact_root = root / ".fuse" / "runs" / record["run_id"]
+    artifact = artifact_root / evidence["artifacts"][0]["path"]
+    content = artifact.read_text(encoding="utf-8")
+    metadata = json.loads(
+        content.splitlines()[0][len(fuse_checks.OUTPUT_METADATA_PREFIX) :]
+    )
+    assert result["outcome"] == "inconclusive"
+    assert "timed out after 1 seconds" in result["summary"]
+    assert metadata["timeout_seconds"] == 1
+    assert metadata["timed_out"] is True
+    assert "started" in content
+    with pytest.raises(fuse_checks.CheckError, match="not passing"):
+        fuse_checks.require_check_evidence(
+            record, "tests", candidate["candidate_id"], artifact_root, config
+        )
 
 
 def test_self_consistent_forged_output_cannot_satisfy_check(tmp_path: Path) -> None:
@@ -866,9 +1042,31 @@ def test_tool_restore_uses_only_selected_locked_package_manager(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root, _spec_dir, config, _policy = check_project(tmp_path)
-    calls: list[tuple[list[str], Path]] = []
+    bounded_calls: list[tuple[list[str], Path, int, int]] = []
+    version_calls: list[list[str]] = []
     monkeypatch.setattr(fuse_checks, "_validate_project_toolchain", lambda *_args: None)
     monkeypatch.setattr(fuse_checks.shutil, "which", lambda _tool: "/usr/bin/uv")
+
+    def fake_bounded_run(
+        command: list[str],
+        cwd: Path,
+        *,
+        timeout_seconds: int,
+        max_output_bytes_per_stream: int,
+    ) -> dict[str, Any]:
+        bounded_calls.append(
+            (command, cwd, timeout_seconds, max_output_bytes_per_stream)
+        )
+        return {
+            "returncode": 0,
+            "stdout": "sync complete\n",
+            "stderr": "",
+            "timed_out": False,
+            "lingering_output_process": False,
+            "capture_incomplete": False,
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+        }
 
     def fake_run(
         command: list[str],
@@ -879,21 +1077,33 @@ def test_tool_restore_uses_only_selected_locked_package_manager(
         text: bool,
         timeout: float,
     ) -> SimpleNamespace:
-        calls.append((command, cwd))
+        version_calls.append(command)
+        assert cwd == root
         assert capture_output is True
         assert check is False
         assert text is True
         assert timeout > 0
-        return SimpleNamespace(returncode=0, stdout="uv 0.9\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="Python 3.11\n", stderr="")
 
+    monkeypatch.setattr(fuse_checks, "_run_bounded_check_command", fake_bounded_run)
     monkeypatch.setattr(fuse_checks.subprocess, "run", fake_run)
 
     result = fuse_checks.prepare_toolchain(root, config)
 
     assert result["ready"] is True
-    assert calls[0] == (["uv", "sync", "--locked"], root)
-    assert all(command[0] == "uv" for command, _cwd in calls)
-    assert "npm" not in [argument for command, _cwd in calls for argument in command]
+    assert bounded_calls == [
+        (
+            ["uv", "sync", "--locked"],
+            root,
+            config["limits"]["checks"]["timeout_seconds"],
+            config["limits"]["checks"]["max_output_bytes_per_stream"],
+        )
+    ]
+    assert version_calls == [
+        ["uv", "--version"],
+        ["uv", "run", "--locked", "python", "--version"],
+    ]
+    assert "npm" not in [argument for command in version_calls for argument in command]
 
 
 def test_restore_failure_is_unavailable_and_leaves_other_checks_ready(

@@ -35,9 +35,11 @@ python_version = "3.11"
 strict = true
 files = [
     "skills/scripts/fuse_config.py",
+    "skills/scripts/fuse_markdown.py",
     "skills/scripts/next_spec_number.py",
     "skills/scripts/plan_waves.py",
     "skills/scripts/sync_check.py",
+    "skills/scripts/fuse_verify.py",
     "tests",
 ]
 
