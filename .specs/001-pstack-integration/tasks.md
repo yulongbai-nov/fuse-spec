@@ -23,7 +23,7 @@
     - Validate the parsed TOML against the versioned JSON Schema, then apply semantic checks for references, bounds, and supported check/role shapes. Store defaults as data and record the host-resolved profile at execution time.
     - Record the selected runtime, package manager, manifest, lockfile, and tool-restoration policy. Initialization validates that the selected files exist and are compatible, reuses an existing configuration, and fails closed without changing consumer package files when the default or supplied pre-assessed template does not match. It does not install tools.
 
-- [ ] T3 Add the versioned run record and single-writer state backend  [id:T3 deps:T1,T2 impl:R2,R3,R5,D-RunControl]
+- [x] T3 Add the versioned run record and single-writer state backend  [id:T3 deps:T1,T2 impl:R2,R3,R5,D-RunControl]
     - **Files:** `.gitignore`, `schemas/run-record.schema.json`, `skills/scripts/fuse_record.py`, `skills/scripts/fuse_state.py`, `tests/`
     - Ignore the local `.fuse/runs/` replica in ordinary code branches; the state backend force-includes it only in the per-run state ref.
     - Test record schema/version validation, stable assignment/finding/evidence IDs, append-only retry history, immutable effective-policy snapshots, and refusal to silently migrate an unknown schema version.
