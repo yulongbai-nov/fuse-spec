@@ -3,7 +3,7 @@ name = "fuse-spec"
 version = "0.1.0"
 description = "Spec-driven development workflow helpers"
 requires-python = ">=3.11"
-dependencies = ["jsonschema>=4.25,<5"]
+dependencies = ["jsonschema>=4.25,<5", "packaging>=24.2,<27"]
 
 [dependency-groups]
 dev = [
@@ -34,8 +34,13 @@ indent-style = "space"
 python_version = "3.11"
 strict = true
 files = [
+    "skills/scripts/fuse_config.py",
     "skills/scripts/next_spec_number.py",
     "skills/scripts/plan_waves.py",
     "skills/scripts/sync_check.py",
     "tests",
 ]
+
+[[tool.mypy.overrides]]
+module = ["jsonschema", "jsonschema.*"]
+ignore_missing_imports = true

@@ -1,0 +1,119 @@
+schema_version = 1
+
+[roles.manager]
+model = "latest-astra"
+reasoning_effort = "max"
+required_tools = ["agents.spawn", "filesystem.read", "filesystem.write", "commands.execute"]
+unavailable_policy = "block"
+fallback_roles = []
+
+[roles.worker]
+model = "latest-luna"
+reasoning_effort = "max"
+required_tools = ["filesystem.read", "filesystem.write", "commands.execute"]
+unavailable_policy = "block"
+fallback_roles = []
+
+[roles.reviewer]
+model = "latest-sol"
+reasoning_effort = "xhigh"
+required_tools = ["filesystem.read", "commands.execute"]
+unavailable_policy = "block"
+fallback_roles = []
+
+[roles.rca]
+model = "latest-astra"
+reasoning_effort = "max"
+required_tools = ["filesystem.read", "filesystem.write", "commands.execute"]
+unavailable_policy = "block"
+fallback_roles = []
+
+[roles.rca_reviewer]
+model = "latest-astra"
+reasoning_effort = "max"
+required_tools = ["filesystem.read", "commands.execute"]
+unavailable_policy = "block"
+fallback_roles = []
+
+[limits.review]
+max_repair_rounds_per_level = 2
+
+[limits.rca]
+attempts_per_hard_blocker = 1
+
+[limits.concurrency]
+ordinary_luna_max_floor = 5
+other_profile_default = 3
+
+[budgets]
+elapsed_time_seconds = "unset"
+
+[budgets.model_usage]
+limit = "unset"
+unit = "tokens"
+
+[overrides]
+allowed_fields = [
+    "limits.concurrency.ordinary_luna_max_floor",
+    "limits.concurrency.other_profile_default",
+    "limits.review.max_repair_rounds_per_level",
+    "budgets.elapsed_time_seconds",
+    "budgets.model_usage.limit",
+]
+
+[overrides.bounds]
+"limits.concurrency.ordinary_luna_max_floor" = { minimum = 1 }
+"limits.concurrency.other_profile_default" = { minimum = 1 }
+"limits.review.max_repair_rounds_per_level" = { minimum = 0, maximum = 2 }
+"budgets.elapsed_time_seconds" = { minimum = 1 }
+"budgets.model_usage.limit" = { minimum = 1 }
+
+[toolchain]
+runtime = "python"
+runtime_version = "3.11"
+runtime_file = ".python-version"
+package_manager = "uv"
+manifest = "pyproject.toml"
+lockfile = "uv.lock"
+selection_policy = "reuse_existing"
+restore_policy = "selected_tools_existing_version_and_lock_only"
+allow_new_package_manager = false
+modify_consumer_package_files = false
+
+[checks.pytest]
+command = ["uv", "run", "--locked", "pytest", "-q"]
+prerequisites = []
+inputs = ["tests/**", "skills/scripts/**"]
+pass_criteria = "exit_code == 0"
+
+[checks.ruff_format]
+command = ["uv", "run", "--locked", "ruff", "format", "--check"]
+prerequisites = []
+inputs = ["**/*.py", "pyproject.toml"]
+pass_criteria = "exit_code == 0"
+
+[checks.ruff_check]
+command = ["uv", "run", "--locked", "ruff", "check"]
+prerequisites = []
+inputs = ["**/*.py", "pyproject.toml"]
+pass_criteria = "exit_code == 0"
+
+[checks.mypy]
+command = ["uv", "run", "--locked", "mypy"]
+prerequisites = []
+inputs = ["skills/scripts/**", "tests/**", "pyproject.toml"]
+pass_criteria = "exit_code == 0"
+
+[checks.config]
+command = [
+    "uv",
+    "run",
+    "--locked",
+    "python",
+    "skills/scripts/fuse_config.py",
+    "validate",
+    ".fuse/config.toml",
+]
+prerequisites = []
+inputs = [".fuse/config.toml", "schemas/project-config.schema.json"]
+pass_criteria = "exit_code == 0"
