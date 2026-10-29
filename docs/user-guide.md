@@ -51,7 +51,7 @@ The run ID for this one-shot command is used only to group output artifacts. It 
 
 ### Local checks and GitHub Actions
 
-`.github/workflows/verify.yml` handles triggers, read-only checkout permission, Python/uv setup, cache, and artifact upload. It invokes `fuse_verify.py` once, just like the local command. It listens to push, pull request, merge queue `merge_group`, and manual workflow dispatch events. It does not carry a second check list or dependency graph. Action versions are pinned to full commit SHAs. The workflow has no project-specific job timeout; GitHub Actions runner time and usage caps are platform settings, separate from Fuse's configurable model, review, and concurrency budgets.
+`.github/workflows/verify.yml` handles triggers, read-only checkout permission, Python/uv setup, cache, and artifact upload. It invokes `fuse_verify.py` once, just like the local command. It listens to push, pull request, and manual workflow dispatch events. It does not carry a second check list or dependency graph. Action versions are pinned to full commit SHAs. The workflow has no project-specific job timeout; GitHub Actions runner time and usage caps are platform settings, separate from Fuse's configurable model, review, and concurrency budgets.
 
 CI status and its uploaded artifacts are remote evidence. A local pass does not prove CI passed, and an absent CI run is unverified. CI does not update the managed run record or accept a task by itself; Fuse still checks the current candidate, required checks, and independent reviews when accepting work.
 
@@ -121,7 +121,7 @@ These local Git-repository regressions exercise the lifecycle and verifier acros
 
 Acceptance is a Fuse state transition. A successful worker message, passing command by itself, review report, or checked task box is not task acceptance. The shared transition validator checks current prerequisites and evidence before changing task status. For managed specs, `/reconcile-spec` treats checkboxes as a non-authoritative projection from accepted record state; it does not edit approved intent. Ordinary non-managed reconciliation retains its legacy behavior.
 
-Automatic merge is permitted only for an assigned PR whose current exact candidate has green required checks, all required reviews, no blocking findings, and repository mergeability. Required merge-queue evidence must match the exact merge-group identity, including the base and prerequisite/target heads. If the provider cannot enforce that binding, Fuse reports a blocker and does not enqueue or merge that candidate.
+Automatic merge is permitted only for an assigned PR whose current exact candidate has green required checks, all required reviews, no blocking findings, and repository mergeability. The target branch must have active effective rules that require pull requests, every applicable strict required check, block force-pushes and deletion, and have no applicable ruleset bypass actors. Fuse chooses a merge method allowed by both repository settings and all applicable pull-request rules. Immediately before merge, it reloads the authoritative run record and revalidates the candidate's checks, reviews, and findings. Fuse then calls GitHub's synchronous direct-merge endpoint with the validated PR head SHA; GitHub rejects a changed head, while strict required checks reject a stale base. If Fuse cannot read current rule, bypass, or run-record evidence, it reports a blocker and does not merge the candidate.
 
 ## Managed operations and recovery
 
@@ -146,8 +146,8 @@ Use `/reconcile-spec` after out-of-band edits, uncertain launches, stale evidenc
 - Models, parallel agent count, tools, usage, host communication, and review-session independence depend on active Codex capabilities and the configured project limits. The configuration expresses preferences and budgets; it cannot grant host features or quota.
 - The coordinator is an active Codex session, not a background monitor. Resume uses the stored state after interruption; no always-alive process watches every repository.
 - Hooks can restore context or remind workers to use the workflow. They are not acceptance gates. The shared CLI validates supported transitions; it cannot prevent every out-of-band action by a worker.
-- A test pass proves only what that configured command checks. Missing tools, stale artifacts, missing PR access, or unavailable remote/merge-group evidence remain explicit blockers or unverified results; they are never silently converted to success.
-- `/reconcile-spec` reports PR state as unverified when no fresh provider observation is supplied. A generated GitHub workflow is not proof that GitHub ran it; inspect the actual check run for the exact commit or merge group.
+- A test pass proves only what that configured command checks. Missing tools, stale artifacts, missing PR access, or unavailable strict branch ruleset evidence remain explicit blockers or unverified results; they are never silently converted to success.
+- `/reconcile-spec` reports PR state as unverified when no fresh provider observation is supplied. A generated GitHub workflow is not proof that GitHub ran it; inspect the actual check run for the exact PR head. Fuse's synchronous GitHub merge call is direct and cannot add a PR to a merge queue.
 
 ## Project layout
 

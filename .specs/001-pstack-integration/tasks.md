@@ -63,8 +63,8 @@
     - **Files:** `skills/scripts/fuse_git.py`, `skills/scripts/fuse_pr.py`, `tests/test_pr_provider.py`
     - Test isolated worker commits, one coordinator publisher, task-to-PR mapping, early draft-PR creation, per-job push/checkpoint order, acyclic derived PR dependencies, and refusal to force-push or bypass repository protection.
     - Use `gh` where available for PR/status operations and record provider, PR, base, and head identities. Keep provider calls behind a testable adapter and report missing CLI/auth/permissions as a blocker.
-    - Materialize the integrated review candidate and the exact current base plus target PR candidate before each merge. Prove every task or branch prerequisite PR is merged and its merge commit is contained in the current base; do not queue a target while a prerequisite remains open. Require only the target's transitive PR closure, not unrelated PR heads.
-    - Bind merge-group checks and all three Fuse review levels to the provider's exact merge-group identity, including the base, merged prerequisite identities, and target head. A merge queue plus target-head match alone is insufficient. If the provider cannot atomically enforce that binding, refuse automatic enqueue and report the blocker.
+    - Materialize the integrated review candidate and the exact current base plus target PR candidate before each merge. Prove every task or branch prerequisite PR is merged and its merge commit is contained in the current base; do not merge a target while a prerequisite remains open. Require only the target's transitive PR closure, not unrelated PR heads.
+    - Require active non-bypassable target-branch protection: PR required, required checks on an up-to-date base, no force-push or deletion. Pin direct merge to the exact PR head SHA; refuse automatic merge if the provider cannot enforce the base/head binding.
     - Merge only the selected PR when current checks, all required review levels, unresolved-finding policy, and repository mergeability satisfy R4; otherwise continue monitoring or report the blocker.
 
 - [x] T8 Route `/reconcile-spec` and task checkbox updates through the shared record  [id:T8 deps:T3,T5,T6 impl:R2,R3,R4,R5,D-RunControl,D-Coordinator]
@@ -80,3 +80,10 @@
     - Use one shared positive-integer timeout and per-stream output-capture cap from `.fuse/config.toml` for configured checks and locked tool restoration. Terminate timed-out process groups where supported; record timeout and truncated-output metadata with candidate-bound evidence, and never treat timeouts or incomplete captures as passing.
     - Document setup, supported Python version, configuration, command usage, state-ref recovery, Codex capability limits, routes, evidence gates, and clear unverified/blocked outcomes. Keep full transcripts and unrelated work outside the run record.
     - Run traceability, dependency planning, all project checks, and the task-, integrated-PR-, and whole-codebase review levels. Resolve findings within their configured maximum of two rounds per level before merge.
+
+
+- [x] T10 Add strict protected-branch direct merge [id:T10 deps:T7,T9 impl:R4,D-PRIntegration,D-Verification]
+    - **Files:** `skills/scripts/fuse_pr.py`, `.github/workflows/verify.yml`, `tests/test_pr_provider.py`, `tests/test_fuse_verify.py`, `docs/user-guide.md`
+    - Read every page of effective rules for the target branch and details for every applicable active repository or organization ruleset. Require PRs, strict required status checks from every applicable ruleset, blocked force-push/deletion, and an empty bypass list; fail closed when GitHub hides or omits bypass data.
+    - Select a merge method enabled by repository settings and every applicable pull-request rule. Use GitHub's synchronous direct-merge endpoint, pin the expected PR head SHA, and never request a bypass. Reload the authoritative run record and revalidate current base/head/check/review evidence and unresolved findings immediately before the call; strict server-side protection must reject a base that moves after preflight.
+    - Remove merge-group triggers and document the synchronous non-queue endpoint. Test missing or weakened protection, missing required check results, stale heads/bases, queue-rule refusal, and refusal to bypass.

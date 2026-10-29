@@ -32,27 +32,32 @@ class ProviderError(RuntimeError):
 
 
 class CandidateMergeProvider(Protocol):
-    """Adapter whose enqueue operation can bind all evidence to one candidate.
+    """Adapter whose merge operation is guarded by current server-side rules.
 
-    Exact binding means the enqueue operation itself enforces the candidate SHA,
-    current base, merged prerequisite identities, target head, and Fuse check and
-    review evidence. A preflight read or a merge queue alone is not sufficient.
+    The provider must pin the PR head in the merge request. Strict protected
+    branch checks bind that head to the current base; a preflight read alone is
+    not sufficient.
     """
 
-    def supports_exact_candidate_binding(self) -> bool:
-        """Return true only when enqueue atomically enforces every supplied ID."""
+    def supports_exact_head_binding(self) -> bool:
+        """Return true only when the provider merge pins the validated PR head."""
 
     def view_pr(self, number: int) -> dict[str, Any]: ...
 
     def branch_rules(self, branch: str) -> list[dict[str, Any]]: ...
 
-    def enqueue_merge(
+    def allowed_merge_methods(
+        self, branch_rules: Sequence[Mapping[str, Any]]
+    ) -> list[str]: ...
+
+    def merge_pr(
         self,
         number: int,
         *,
         candidate_sha: str,
         base_sha: str,
         head_sha: str,
+        merge_method: str,
         included_heads: Sequence[str],
         prerequisite_states: Mapping[str, Mapping[str, str]],
         required_checks: Sequence[str],
@@ -213,35 +218,236 @@ class GitHubCLI:
         self._run("pr", "edit", str(number), "--repo", self.repository, "--body", body)
 
     def branch_rules(self, branch: str) -> list[dict[str, Any]]:
-        """Read the effective GitHub branch rules, failing closed on denial."""
+        """Read effective branch rules and their bypass lists, failing closed."""
         encoded = quote(branch, safe="")
         output = self._run(
             "api",
-            f"repos/{self.repository}/rules/branches/{encoded}",
+            "--paginate",
+            "--slurp",
+            f"repos/{self.repository}/rules/branches/{encoded}?per_page=100",
         )
         try:
             data = json.loads(output)
         except json.JSONDecodeError as error:
             raise ProviderError(
-                "GitHub branch rules endpoint returned invalid JSON"
+                "GitHub effective branch rules returned invalid JSON"
             ) from error
-        if not isinstance(data, list) or any(not isinstance(row, dict) for row in data):
+        if not isinstance(data, list):
             raise ProviderError(
-                "GitHub branch rules endpoint returned an invalid result"
+                "GitHub effective branch rules returned an invalid result"
             )
-        return data
+        if data and all(isinstance(row, dict) for row in data):
+            pages = [data]
+        elif all(
+            isinstance(page, list) and all(isinstance(row, dict) for row in page)
+            for page in data
+        ):
+            pages = data
+        else:
+            raise ProviderError(
+                "GitHub paginated branch rules returned an invalid result"
+            )
+        effective_rules = [row for page in pages for row in page]
 
-    def supports_exact_candidate_binding(self) -> bool:
-        """GitHub CLI can pin a PR head, but not Fuse's exact merge group."""
-        return False
+        rules: list[dict[str, Any]] = []
 
-    def enqueue_merge(
+        ruleset_ids: set[int] = set()
+        ruleset_sources: dict[int, tuple[str, str]] = {}
+        for row in effective_rules:
+            ruleset_id = row.get("ruleset_id")
+            if not isinstance(ruleset_id, int) or isinstance(ruleset_id, bool):
+                raise ProviderError("GitHub effective rule has an invalid ruleset ID")
+            ruleset_ids.add(ruleset_id)
+            source_type = row.get("ruleset_source_type")
+            source = row.get("ruleset_source")
+            if (
+                not isinstance(source_type, str)
+                or source_type not in {"Repository", "Organization"}
+                or not isinstance(source, str)
+                or not source
+            ):
+                raise ProviderError(
+                    "GitHub effective rule has an unreadable ruleset source"
+                )
+            if (
+                source_type == "Repository"
+                and source.casefold() != self.repository.casefold()
+            ):
+                raise ProviderError(
+                    "GitHub effective repository ruleset has an unexpected source"
+                )
+            identity = (source_type, source)
+            previous = ruleset_sources.get(ruleset_id)
+            if previous is not None and previous != identity:
+                raise ProviderError(
+                    "GitHub returned conflicting sources for an applicable ruleset"
+                )
+            ruleset_sources[ruleset_id] = identity
+            parameters = row.get("parameters", {})
+            if not isinstance(parameters, Mapping):
+                raise ProviderError("GitHub effective rule has invalid parameters")
+            rule_type = row.get("type")
+            if rule_type == "pull_request":
+                allowed_methods = parameters.get("allowed_merge_methods")
+                if allowed_methods is not None:
+                    if (
+                        not isinstance(allowed_methods, Sequence)
+                        or isinstance(allowed_methods, str)
+                        or not allowed_methods
+                        or any(
+                            not isinstance(method, str)
+                            or method not in {"merge", "squash", "rebase"}
+                            for method in allowed_methods
+                        )
+                    ):
+                        raise ProviderError(
+                            "GitHub pull request merge methods are invalid"
+                        )
+                rules.append(
+                    {
+                        "type": "pull_request",
+                        "required_approving_review_count": parameters.get(
+                            "required_approving_review_count"
+                        ),
+                        "allowed_merge_methods": (
+                            sorted(set(allowed_methods))
+                            if allowed_methods is not None
+                            else None
+                        ),
+                        "ruleset_id": ruleset_id,
+                    }
+                )
+            elif rule_type == "required_status_checks":
+                checks = parameters.get("required_status_checks", ())
+                if not isinstance(checks, Sequence) or isinstance(checks, str):
+                    raise ProviderError("GitHub required checks are invalid")
+                contexts: list[str] = []
+                for check in checks:
+                    if (
+                        not isinstance(check, Mapping)
+                        or not isinstance(check.get("context"), str)
+                        or not check.get("context")
+                    ):
+                        raise ProviderError(
+                            "GitHub required check context is unreadable"
+                        )
+                    contexts.append(check["context"])
+                rules.append(
+                    {
+                        "type": "required_status_checks",
+                        "strict": parameters.get("strict_required_status_checks_policy")
+                        is True,
+                        "contexts": sorted(set(contexts)),
+                        "ruleset_id": ruleset_id,
+                    }
+                )
+            elif rule_type == "non_fast_forward":
+                rules.append(
+                    {
+                        "type": "force_pushes",
+                        "enabled": False,
+                        "ruleset_id": ruleset_id,
+                    }
+                )
+            elif rule_type == "deletion":
+                rules.append(
+                    {
+                        "type": "deletions",
+                        "enabled": False,
+                        "ruleset_id": ruleset_id,
+                    }
+                )
+            elif rule_type == "merge_queue":
+                rules.append({"type": "merge_queue", "ruleset_id": ruleset_id})
+
+        for ruleset_id in sorted(ruleset_ids):
+            source_type, source = ruleset_sources[ruleset_id]
+            ruleset_path = (
+                f"repos/{self.repository}/rulesets/{ruleset_id}"
+                if source_type == "Repository"
+                else f"orgs/{quote(source, safe='')}/rulesets/{ruleset_id}"
+            )
+            details_output = self._run("api", ruleset_path)
+            try:
+                details = json.loads(details_output)
+            except json.JSONDecodeError as error:
+                raise ProviderError(
+                    "GitHub ruleset details returned invalid JSON"
+                ) from error
+            if (
+                not isinstance(details, dict)
+                or details.get("id") != ruleset_id
+                or details.get("enforcement") != "active"
+            ):
+                raise ProviderError("GitHub applicable ruleset is not confirmed active")
+            bypass_actors = details.get("bypass_actors")
+            if not isinstance(bypass_actors, Sequence) or isinstance(
+                bypass_actors, str
+            ):
+                raise ProviderError("GitHub ruleset bypass actors are unreadable")
+            rules.append(
+                {
+                    "type": "ruleset_bypass_actors",
+                    "ruleset_id": ruleset_id,
+                    "bypass_actors": list(bypass_actors),
+                    "active": True,
+                }
+            )
+        return rules
+
+    def supports_exact_head_binding(self) -> bool:
+        """GitHub's merge API pins the head; strict branch rules pin its base."""
+        return True
+
+    def allowed_merge_methods(
+        self, branch_rules: Sequence[Mapping[str, Any]]
+    ) -> list[str]:
+        """Return methods enabled by both repository settings and all rulesets."""
+        output = self._run("api", f"repos/{self.repository}")
+        try:
+            repository = json.loads(output)
+        except json.JSONDecodeError as error:
+            raise ProviderError(
+                "GitHub repository settings returned invalid JSON"
+            ) from error
+        if not isinstance(repository, dict):
+            raise ProviderError("GitHub repository settings are unreadable")
+        setting_by_method = {
+            "merge": "allow_merge_commit",
+            "squash": "allow_squash_merge",
+            "rebase": "allow_rebase_merge",
+        }
+        enabled: set[str] = set()
+        for method, setting in setting_by_method.items():
+            value = repository.get(setting)
+            if not isinstance(value, bool):
+                raise ProviderError("GitHub repository merge settings are unreadable")
+            if value:
+                enabled.add(method)
+        for rule in branch_rules:
+            if rule.get("type") != "pull_request":
+                continue
+            allowed = rule.get("allowed_merge_methods")
+            if allowed is None:
+                continue
+            if (
+                not isinstance(allowed, Sequence)
+                or isinstance(allowed, str)
+                or not allowed
+                or any(method not in setting_by_method for method in allowed)
+            ):
+                raise ProviderError("GitHub ruleset merge methods are unreadable")
+            enabled.intersection_update(allowed)
+        return [method for method in ("squash", "merge", "rebase") if method in enabled]
+
+    def merge_pr(
         self,
         number: int,
         *,
         candidate_sha: str,
         base_sha: str,
         head_sha: str,
+        merge_method: str,
         included_heads: Sequence[str],
         prerequisite_states: Mapping[str, Mapping[str, str]],
         required_checks: Sequence[str],
@@ -249,21 +455,40 @@ class GitHubCLI:
         review_evidence: Mapping[str, Mapping[str, Any]],
         unresolved_findings: Sequence[Mapping[str, Any]],
     ) -> str:
-        """Refuse merge queues that cannot bind Fuse evidence to the exact group.
+        """Direct-merge only with the exact PR head and strict branch rules.
 
-        `gh pr merge --auto --match-head-commit` pins only the PR head. GitHub's
-        merge queue may construct a newer merge-group candidate from a changed
-        base after Fuse's checks and reviews ran, and the CLI does not let Fuse
-        require evidence for that exact group SHA. Until a provider adapter can
-        bind all of these identities atomically, automatic merge is unsafe.
+        The REST merge endpoint's `sha` field rejects a changed PR head. The
+        protected base must require a pull request and strict required checks,
+        so a changed base invalidates the successful merge-candidate checks.
+        This call never requests a rules bypass.
         """
-        del number, candidate_sha, base_sha, head_sha, included_heads
+        del candidate_sha, base_sha, included_heads
         del prerequisite_states
         del required_checks, check_evidence, review_evidence, unresolved_findings
-        raise ProviderError(
-            "GitHub CLI cannot bind Fuse check and review evidence to the exact "
-            "merge-group candidate; automatic enqueue is blocked"
+        if merge_method not in {"merge", "squash", "rebase"}:
+            raise ProviderError("GitHub merge method is invalid")
+        output = self._run(
+            "api",
+            "--method",
+            "PUT",
+            f"repos/{self.repository}/pulls/{number}/merge",
+            "-f",
+            f"sha={head_sha}",
+            "-f",
+            f"merge_method={merge_method}",
         )
+        try:
+            result = json.loads(output)
+        except json.JSONDecodeError as error:
+            raise ProviderError(
+                "GitHub merge endpoint returned invalid JSON"
+            ) from error
+        if not isinstance(result, dict) or result.get("merged") is not True:
+            raise ProviderError("GitHub did not confirm the guarded pull request merge")
+        merge_sha = result.get("sha")
+        if not isinstance(merge_sha, str) or not SHA_RE.fullmatch(merge_sha):
+            raise ProviderError("GitHub merge endpoint returned an invalid merge SHA")
+        return merge_sha
 
 
 def _pr_key(value: str | int) -> str:
@@ -725,7 +950,7 @@ def _provider_checks_ready(value: Any) -> bool:
         return False
     state = value.get("state")
     if state is not None:
-        return state == "SUCCESS"
+        return isinstance(state, str) and state == "SUCCESS"
     status = value.get("status")
     conclusion = value.get("conclusion")
     return status == "COMPLETED" and conclusion in {
@@ -743,6 +968,126 @@ def _provider_check_pending(value: Mapping[str, Any]) -> bool:
         "REQUESTED",
         "WAITING",
     }
+
+
+def _strict_branch_ruleset_ready(
+    branch_rules: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Require active, non-bypassable PR and strict-check rules on the target."""
+    pull_requests = [
+        rule for rule in branch_rules if rule.get("type") == "pull_request"
+    ]
+    status_checks = [
+        rule for rule in branch_rules if rule.get("type") == "required_status_checks"
+    ]
+    force_pushes = next(
+        (rule for rule in branch_rules if rule.get("type") == "force_pushes"), None
+    )
+    deletions = next(
+        (rule for rule in branch_rules if rule.get("type") == "deletions"), None
+    )
+    bypass_rules = [
+        rule for rule in branch_rules if rule.get("type") == "ruleset_bypass_actors"
+    ]
+    if any(
+        rule.get("ruleset_id") is not None
+        and (
+            not isinstance(rule.get("ruleset_id"), int)
+            or isinstance(rule.get("ruleset_id"), bool)
+        )
+        for rule in branch_rules
+    ):
+        return False
+    ruleset_ids = {
+        rule.get("ruleset_id")
+        for rule in branch_rules
+        if isinstance(rule.get("ruleset_id"), int)
+        and not isinstance(rule.get("ruleset_id"), bool)
+    }
+    required_rule_ids = {
+        rule.get("ruleset_id")
+        for rule in (*pull_requests, *status_checks, force_pushes, deletions)
+        if isinstance(rule, Mapping)
+    }
+    if (
+        not pull_requests
+        or not all(isinstance(rule, Mapping) for rule in pull_requests)
+        or not all(isinstance(rule, Mapping) for rule in (force_pushes, deletions))
+        or not status_checks
+        or not all(isinstance(rule, Mapping) for rule in status_checks)
+    ):
+        return False
+    assert force_pushes is not None
+    assert deletions is not None
+    no_bypass = (
+        bool(ruleset_ids)
+        and required_rule_ids <= ruleset_ids
+        and {rule.get("ruleset_id") for rule in bypass_rules} == ruleset_ids
+        and all(
+            rule.get("active") is True and rule.get("bypass_actors") == []
+            for rule in bypass_rules
+        )
+    )
+    return (
+        all(
+            rule.get("type") == "pull_request"
+            and isinstance(rule.get("required_approving_review_count"), int)
+            and not isinstance(rule.get("required_approving_review_count"), bool)
+            and rule.get("required_approving_review_count", -1) >= 0
+            and (
+                rule.get("allowed_merge_methods") is None
+                or (
+                    isinstance(rule.get("allowed_merge_methods"), Sequence)
+                    and not isinstance(rule.get("allowed_merge_methods"), str)
+                    and bool(rule.get("allowed_merge_methods"))
+                    and all(
+                        isinstance(method, str)
+                        and method in {"merge", "squash", "rebase"}
+                        for method in rule.get("allowed_merge_methods", ())
+                    )
+                )
+            )
+            for rule in pull_requests
+        )
+        and no_bypass
+        and all(
+            rule.get("strict") is True
+            and isinstance((contexts := rule.get("contexts", ())), Sequence)
+            and not isinstance(contexts, str)
+            and bool(contexts)
+            and all(isinstance(context, str) and context for context in contexts)
+            for rule in status_checks
+        )
+        and force_pushes.get("enabled") is False
+        and deletions.get("enabled") is False
+        and not any(rule.get("type") == "merge_queue" for rule in branch_rules)
+    )
+
+
+def _required_provider_checks_ready(
+    branch_rules: Sequence[Mapping[str, Any]],
+    external_checks: Sequence[Mapping[str, Any]],
+) -> bool:
+    rules = [
+        item for item in branch_rules if item.get("type") == "required_status_checks"
+    ]
+    if not rules or not all(isinstance(rule, Mapping) for rule in rules):
+        return False
+    for rule in rules:
+        contexts = rule.get("contexts", ())
+        if not isinstance(contexts, Sequence) or isinstance(contexts, str):
+            return False
+        if not all(
+            isinstance(context, str)
+            and any(
+                (check.get("name") or check.get("context")) == context
+                and _provider_checks_ready(check)
+                for check in external_checks
+            )
+            for context in contexts
+        ):
+            return False
+    return True
 
 
 def assess_merge(
@@ -847,15 +1192,17 @@ def assess_merge(
             candidate_sha,
             finding_ids=[item.get("id") for item in unresolved_findings],
         )
-    if not any(item.get("type") == "merge_queue" for item in branch_rules):
-        return _blocked("atomic_merge_queue_unavailable", candidate_sha)
+    if not _strict_branch_ruleset_ready(branch_rules):
+        return _blocked("strict_branch_protection_unavailable", candidate_sha)
+    if not _required_provider_checks_ready(branch_rules, external_checks):
+        return _blocked("provider_required_check_missing_or_failed", candidate_sha)
     try:
         binding_supported = (
-            provider is not None and provider.supports_exact_candidate_binding()
+            provider is not None and provider.supports_exact_head_binding()
         )
     except Exception:
         binding_supported = False
-    if not binding_supported:
+    if provider is None or not binding_supported:
         return _blocked(
             "provider_cannot_bind_exact_merge_candidate",
             candidate_sha,
@@ -863,14 +1210,29 @@ def assess_merge(
             head_sha=expected_head_sha,
             prerequisite_states=dict(candidate.prerequisite_states),
         )
+    try:
+        available_merge_methods = provider.allowed_merge_methods(branch_rules)
+    except Exception:
+        return _blocked("provider_merge_methods_unavailable", candidate_sha)
+    if (
+        not isinstance(available_merge_methods, Sequence)
+        or isinstance(available_merge_methods, str)
+        or not available_merge_methods
+        or any(
+            not isinstance(method, str) or method not in {"merge", "squash", "rebase"}
+            for method in available_merge_methods
+        )
+    ):
+        return _blocked("provider_has_no_compatible_merge_method", candidate_sha)
     return MergeDecision(
         True,
-        "ready_for_merge_queue",
+        "ready_for_direct_merge",
         candidate_sha,
         {
             "base_sha": expected_base_sha,
             "head_sha": expected_head_sha,
             "target_pr": candidate.target_pr,
+            "merge_method": available_merge_methods[0],
             "included_heads": list(candidate.head_shas),
             "prerequisite_states": {
                 key: dict(value) for key, value in candidate.prerequisite_states.items()
@@ -888,24 +1250,30 @@ def assess_merge(
     )
 
 
-def enqueue_merge(
+def merge_pr(
     provider: CandidateMergeProvider,
     *,
     number: int,
     expected_head_sha: str,
     decision: MergeDecision,
+    refresh_assessment: Callable[[], MergeDecision],
 ) -> str:
-    """Request only a provider operation bound to the full validated candidate."""
+    """Direct-merge only after reloading current Fuse evidence and server gates.
+
+    ``refresh_assessment`` must reload the authoritative run record, current
+    reviews/findings, and candidate-bound checks, then rerun ``assess_merge``.
+    This catches evidence invalidated while the provider preflight is running.
+    """
     if not decision.allowed:
         raise ProviderError(f"merge is blocked: {decision.reason}")
     if (
-        decision.reason != "ready_for_merge_queue"
+        decision.reason != "ready_for_direct_merge"
         or decision.details.get("head_sha") != expected_head_sha
         or decision.details.get("target_pr") != str(number)
     ):
         raise ProviderError("merge decision is not bound to the requested PR head")
     try:
-        binding_supported = provider.supports_exact_candidate_binding()
+        binding_supported = provider.supports_exact_head_binding()
     except Exception as error:
         raise ProviderError(
             "provider exact-candidate binding capability could not be verified"
@@ -915,9 +1283,6 @@ def enqueue_merge(
             "provider cannot atomically bind the actual merge to Fuse's exact "
             "candidate, checks, reviews, and prerequisite identities"
         )
-    enqueue_exact = getattr(provider, "enqueue_merge", None)
-    if not callable(enqueue_exact):
-        raise ProviderError("provider has no atomic exact-candidate enqueue operation")
     try:
         current = provider.view_pr(number)
         expected_base = decision.details.get("base_sha")
@@ -927,15 +1292,15 @@ def enqueue_merge(
             raise ProviderError("merge decision has invalid prerequisite identities")
         if current.get("state") != "OPEN" or current.get("isDraft") is not False:
             raise ProviderError(
-                "merge guard changed before enqueue: PR is not open and ready"
+                "merge guard changed before merge: PR is not open and ready"
             )
         if current.get("baseRefOid") != expected_base:
-            raise ProviderError("merge guard changed before enqueue: base moved")
+            raise ProviderError("merge guard changed before merge: base moved")
         if current.get("headRefOid") != expected_head_sha:
-            raise ProviderError("merge guard changed before enqueue: PR head moved")
+            raise ProviderError("merge guard changed before merge: PR head moved")
         if expected_heads != (expected_head_sha,):
             raise ProviderError(
-                "merge guard changed before enqueue: candidate is not the exact "
+                "merge guard changed before merge: candidate is not the exact "
                 "single-target merge candidate"
             )
         for prerequisite, expected in expected_prerequisites.items():
@@ -965,43 +1330,66 @@ def enqueue_merge(
                 or current_merge_sha != expected.get("merge_sha")
             ):
                 raise ProviderError(
-                    f"merge guard changed before enqueue: prerequisite PR "
+                    f"merge guard changed before merge: prerequisite PR "
                     f"{prerequisite} is no longer the validated merge"
                 )
         if current.get("mergeable") not in {True, "MERGEABLE"}:
-            raise ProviderError(
-                "merge guard changed before enqueue: PR is not mergeable"
-            )
+            raise ProviderError("merge guard changed before merge: PR is not mergeable")
         if current.get("mergeStateStatus") != "CLEAN":
             raise ProviderError(
-                "merge guard changed before enqueue: provider state is not clean"
+                "merge guard changed before merge: provider state is not clean"
             )
         if current.get("reviewDecision") in {"CHANGES_REQUESTED", "REVIEW_REQUIRED"}:
-            raise ProviderError(
-                "merge guard changed before enqueue: review is required"
-            )
+            raise ProviderError("merge guard changed before merge: review is required")
         external_checks = current.get("statusCheckRollup", ())
         if not isinstance(external_checks, Sequence) or isinstance(
             external_checks, str
         ):
             raise ProviderError(
-                "merge guard changed before enqueue: checks are unreadable"
+                "merge guard changed before merge: checks are unreadable"
             )
         if any(not _provider_checks_ready(item) for item in external_checks):
             raise ProviderError(
-                "merge guard changed before enqueue: checks are not green"
+                "merge guard changed before merge: checks are not green"
             )
         rules = provider.branch_rules(str(current.get("baseRefName", "")))
-        if not any(item.get("type") == "merge_queue" for item in rules):
+        if not _strict_branch_ruleset_ready(rules):
             raise ProviderError(
-                "merge guard changed before enqueue: merge queue is unavailable"
+                "merge guard is unavailable: strict branch protection is missing"
+            )
+        if not _required_provider_checks_ready(rules, external_checks):
+            raise ProviderError(
+                "merge guard changed before merge: required provider checks are missing"
+            )
+        merge_method = decision.details.get("merge_method")
+        try:
+            current_merge_methods = provider.allowed_merge_methods(rules)
+        except Exception as error:
+            raise ProviderError(
+                "merge guard is unavailable: repository merge methods are unreadable"
+            ) from error
+        if merge_method not in current_merge_methods:
+            raise ProviderError(
+                "merge guard changed before merge: selected merge method is "
+                "no longer allowed"
             )
         try:
-            return enqueue_exact(
+            refreshed = refresh_assessment()
+        except Exception as error:
+            raise ProviderError(
+                "current Fuse merge evidence could not be refreshed"
+            ) from error
+        if not isinstance(refreshed, MergeDecision) or refreshed != decision:
+            raise ProviderError(
+                "current Fuse review/check evidence changed after merge assessment"
+            )
+        try:
+            return provider.merge_pr(
                 number,
                 candidate_sha=decision.candidate_sha,
                 base_sha=str(expected_base),
                 head_sha=expected_head_sha,
+                merge_method=str(merge_method),
                 included_heads=expected_heads,
                 prerequisite_states=expected_prerequisites,
                 required_checks=decision.details.get("checks", ()),
@@ -1013,7 +1401,7 @@ def enqueue_merge(
             raise
         except Exception as error:
             raise ProviderError(
-                "provider exact-candidate enqueue failed; automatic merge is blocked"
+                "provider guarded merge failed; automatic merge is blocked"
             ) from error
     except ProviderError:
         raise

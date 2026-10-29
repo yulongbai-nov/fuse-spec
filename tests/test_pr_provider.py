@@ -18,6 +18,32 @@ fuse_pr: Any = importlib.import_module("fuse_pr")
 fuse_record: Any = importlib.import_module("fuse_record")
 
 
+def strict_branch_rules(checks: tuple[str, ...] = ("tests",)) -> list[dict[str, Any]]:
+    ruleset_id = 42
+    return [
+        {
+            "type": "pull_request",
+            "required_approving_review_count": 0,
+            "allowed_merge_methods": ["squash"],
+            "ruleset_id": ruleset_id,
+        },
+        {
+            "type": "required_status_checks",
+            "strict": True,
+            "contexts": list(checks),
+            "ruleset_id": ruleset_id,
+        },
+        {"type": "force_pushes", "enabled": False, "ruleset_id": ruleset_id},
+        {"type": "deletions", "enabled": False, "ruleset_id": ruleset_id},
+        {
+            "type": "ruleset_bypass_actors",
+            "ruleset_id": ruleset_id,
+            "bypass_actors": [],
+            "active": True,
+        },
+    ]
+
+
 def git(root: Path, *arguments: str) -> str:
     result = subprocess.run(
         ["git", *arguments],
@@ -247,8 +273,9 @@ class FakeProvider:
         self.created: list[tuple[str, str, str, str]] = []
         self.snapshot: dict[str, Any] = {}
         self.pr_snapshots: dict[int, dict[str, Any]] = {}
-        self.rules: list[dict[str, Any]] = [{"type": "merge_queue"}]
-        self.queued: list[dict[str, Any]] = []
+        self.rules: list[dict[str, Any]] = strict_branch_rules()
+        self.merge_methods = ["squash"]
+        self.merged: list[dict[str, Any]] = []
 
     def find_open_prs(self, head_branch: str, base_branch: str) -> list[dict[str, Any]]:
         return list(self.rows)
@@ -272,22 +299,32 @@ class FakeProvider:
     def view_pr(self, number: int) -> dict[str, Any]:
         return dict(self.pr_snapshots.get(number, self.snapshot))
 
-    def supports_exact_candidate_binding(self) -> bool:
+    def supports_exact_head_binding(self) -> bool:
         return True
 
     def branch_rules(self, branch: str) -> list[dict[str, Any]]:
         return list(self.rules)
 
+    def allowed_merge_methods(self, branch_rules: Any) -> list[str]:
+        methods = list(self.merge_methods)
+        for rule in branch_rules:
+            if rule.get("type") == "pull_request":
+                allowed = rule.get("allowed_merge_methods")
+                if allowed is not None:
+                    methods = [method for method in methods if method in allowed]
+        return methods
+
     def update_pr_body(self, number: int, body: str) -> None:
         self.snapshot["body"] = body
 
-    def enqueue_merge(
+    def merge_pr(
         self,
         number: int,
         *,
         candidate_sha: str,
         base_sha: str,
         head_sha: str,
+        merge_method: str,
         included_heads: list[str] | tuple[str, ...],
         prerequisite_states: dict[str, dict[str, str]],
         required_checks: list[str] | tuple[str, ...],
@@ -295,12 +332,13 @@ class FakeProvider:
         review_evidence: dict[str, dict[str, Any]],
         unresolved_findings: list[dict[str, Any]] | tuple[dict[str, Any], ...],
     ) -> str:
-        self.queued.append(
+        self.merged.append(
             {
                 "number": number,
                 "candidate_sha": candidate_sha,
                 "base_sha": base_sha,
                 "head_sha": head_sha,
+                "merge_method": merge_method,
                 "included_heads": tuple(included_heads),
                 "prerequisite_states": prerequisite_states,
                 "required_checks": tuple(required_checks),
@@ -309,7 +347,7 @@ class FakeProvider:
                 "unresolved_findings": tuple(unresolved_findings),
             }
         )
-        return "queued"
+        return "merged"
 
 
 def test_ensure_draft_pr_reuses_one_compatible_pr_or_creates_linked_draft() -> None:
@@ -410,33 +448,269 @@ def test_github_cli_uses_draft_flag_and_reads_pinned_pr_fields(tmp_path: Path) -
     assert "--admin" not in create_call
 
 
-def test_github_cli_refuses_unbound_merge_queue_without_provider_call(
+def test_github_cli_direct_merge_pins_head_and_does_not_bypass_rules(
     tmp_path: Path,
 ) -> None:
     calls: list[list[str]] = []
 
     def runner(args: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
         calls.append(args)
-        return subprocess.CompletedProcess(args, 0, "queued", "")
-
-    provider = fuse_pr.GitHubCLI("example/project", tmp_path, runner=runner)
-    with pytest.raises(
-        fuse_pr.ProviderError, match="cannot bind Fuse check and review evidence"
-    ):
-        provider.enqueue_merge(
-            7,
-            candidate_sha="a" * 40,
-            base_sha="b" * 40,
-            head_sha="c" * 40,
-            included_heads=["c" * 40],
-            prerequisite_states={},
-            required_checks=[],
-            check_evidence={},
-            review_evidence={},
-            unresolved_findings=[],
+        return subprocess.CompletedProcess(
+            args, 0, json.dumps({"sha": "d" * 40, "merged": True}), ""
         )
 
-    assert calls == []
+    provider = fuse_pr.GitHubCLI("example/project", tmp_path, runner=runner)
+    result = provider.merge_pr(
+        7,
+        candidate_sha="a" * 40,
+        base_sha="b" * 40,
+        head_sha="c" * 40,
+        merge_method="rebase",
+        included_heads=["c" * 40],
+        prerequisite_states={},
+        required_checks=["tests"],
+        check_evidence={},
+        review_evidence={},
+        unresolved_findings=[],
+    )
+
+    assert result == "d" * 40
+    assert calls == [
+        [
+            "gh",
+            "api",
+            "--method",
+            "PUT",
+            "repos/example/project/pulls/7/merge",
+            "-f",
+            "sha=" + "c" * 40,
+            "-f",
+            "merge_method=rebase",
+        ]
+    ]
+    assert "merge-async" not in calls[0]
+    assert not any("bypass" in argument for argument in calls[0])
+    assert "--admin" not in calls[0]
+
+
+def test_github_cli_reads_active_ruleset_and_empty_bypass_list(
+    tmp_path: Path,
+) -> None:
+    applied_rules = [
+        {
+            "type": "pull_request",
+            "ruleset_source_type": "Repository",
+            "ruleset_source": "Example/Project",
+            "ruleset_id": 42,
+            "parameters": {
+                "required_approving_review_count": 0,
+                "allowed_merge_methods": ["rebase"],
+            },
+        },
+        {
+            "type": "required_status_checks",
+            "ruleset_source_type": "Repository",
+            "ruleset_source": "Example/Project",
+            "ruleset_id": 42,
+            "parameters": {
+                "strict_required_status_checks_policy": True,
+                "required_status_checks": [{"context": "verify"}],
+            },
+        },
+        {
+            "type": "deletion",
+            "ruleset_source_type": "Repository",
+            "ruleset_source": "Example/Project",
+            "ruleset_id": 42,
+        },
+        {
+            "type": "non_fast_forward",
+            "ruleset_source_type": "Repository",
+            "ruleset_source": "Example/Project",
+            "ruleset_id": 42,
+        },
+    ]
+    ruleset = {"id": 42, "enforcement": "active", "bypass_actors": []}
+    calls: list[list[str]] = []
+
+    def runner(args: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        result = ruleset if args[-1].endswith("/rulesets/42") else [applied_rules]
+        return subprocess.CompletedProcess(args, 0, json.dumps(result), "")
+
+    provider = fuse_pr.GitHubCLI("example/project", tmp_path, runner=runner)
+    rules = provider.branch_rules("main")
+
+    assert rules == [
+        {
+            "type": "pull_request",
+            "required_approving_review_count": 0,
+            "allowed_merge_methods": ["rebase"],
+            "ruleset_id": 42,
+        },
+        {
+            "type": "required_status_checks",
+            "strict": True,
+            "contexts": ["verify"],
+            "ruleset_id": 42,
+        },
+        {"type": "deletions", "enabled": False, "ruleset_id": 42},
+        {"type": "force_pushes", "enabled": False, "ruleset_id": 42},
+        {
+            "type": "ruleset_bypass_actors",
+            "ruleset_id": 42,
+            "bypass_actors": [],
+            "active": True,
+        },
+    ]
+    assert calls == [
+        [
+            "gh",
+            "api",
+            "--paginate",
+            "--slurp",
+            "repos/example/project/rules/branches/main?per_page=100",
+        ],
+        ["gh", "api", "repos/example/project/rulesets/42"],
+    ]
+
+
+def test_github_cli_intersects_repository_and_ruleset_merge_methods(
+    tmp_path: Path,
+) -> None:
+    calls: list[list[str]] = []
+
+    def runner(args: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        repository_settings = {
+            "allow_merge_commit": True,
+            "allow_squash_merge": True,
+            "allow_rebase_merge": True,
+        }
+        return subprocess.CompletedProcess(args, 0, json.dumps(repository_settings), "")
+
+    provider = fuse_pr.GitHubCLI("example/project", tmp_path, runner=runner)
+    methods = provider.allowed_merge_methods(
+        [
+            {"type": "pull_request", "allowed_merge_methods": ["merge", "rebase"]},
+            {"type": "pull_request", "allowed_merge_methods": ["rebase"]},
+        ]
+    )
+
+    assert methods == ["rebase"]
+    assert calls == [["gh", "api", "repos/example/project"]]
+
+
+def test_github_cli_reads_bypass_actors_from_later_rules_pages(
+    tmp_path: Path,
+) -> None:
+    first_page = [
+        {
+            "type": "pull_request",
+            "ruleset_source_type": "Repository",
+            "ruleset_source": "example/project",
+            "ruleset_id": 42,
+            "parameters": {"required_approving_review_count": 0},
+        },
+        {
+            "type": "required_status_checks",
+            "ruleset_source_type": "Repository",
+            "ruleset_source": "example/project",
+            "ruleset_id": 42,
+            "parameters": {
+                "strict_required_status_checks_policy": True,
+                "required_status_checks": [{"context": "verify"}],
+            },
+        },
+        {
+            "type": "deletion",
+            "ruleset_source_type": "Repository",
+            "ruleset_source": "example/project",
+            "ruleset_id": 42,
+        },
+        {
+            "type": "non_fast_forward",
+            "ruleset_source_type": "Repository",
+            "ruleset_source": "example/project",
+            "ruleset_id": 42,
+        },
+    ]
+    second_page = [
+        {
+            "type": "required_signatures",
+            "ruleset_source_type": "Organization",
+            "ruleset_source": "example-org",
+            "ruleset_id": 43,
+        }
+    ]
+    rulesets = {
+        42: {"id": 42, "enforcement": "active", "bypass_actors": []},
+        43: {
+            "id": 43,
+            "enforcement": "active",
+            "bypass_actors": [
+                {"actor_type": "RepositoryRole", "bypass_mode": "always"}
+            ],
+        },
+    }
+    calls: list[list[str]] = []
+
+    def runner(args: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        if "/rulesets/" in args[-1]:
+            ruleset_id = int(args[-1].rsplit("/", maxsplit=1)[1])
+            result: Any = rulesets[ruleset_id]
+        else:
+            result = [first_page, second_page]
+        return subprocess.CompletedProcess(args, 0, json.dumps(result), "")
+
+    provider = fuse_pr.GitHubCLI("example/project", tmp_path, runner=runner)
+    rules = provider.branch_rules("main")
+
+    assert [call[-1] for call in calls if "/rulesets/" in call[-1]] == [
+        "repos/example/project/rulesets/42",
+        "orgs/example-org/rulesets/43",
+    ]
+    assert fuse_pr._strict_branch_ruleset_ready(rules) is False
+
+
+def test_github_cli_rejects_effective_rule_without_a_ruleset_id(
+    tmp_path: Path,
+) -> None:
+    rules = [[{"type": "required_signatures"}]]
+
+    def runner(args: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args, 0, json.dumps(rules), "")
+
+    provider = fuse_pr.GitHubCLI("example/project", tmp_path, runner=runner)
+    with pytest.raises(fuse_pr.ProviderError, match="invalid ruleset ID"):
+        provider.branch_rules("main")
+
+
+def test_github_cli_fails_closed_when_ruleset_bypass_list_is_hidden(
+    tmp_path: Path,
+) -> None:
+    applied_rules = [
+        {
+            "type": "pull_request",
+            "ruleset_source_type": "Repository",
+            "ruleset_source": "example/project",
+            "ruleset_id": 42,
+            "parameters": {"required_approving_review_count": 0},
+        }
+    ]
+
+    def runner(args: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        result = (
+            {"id": 42, "enforcement": "active"}
+            if args[-1].endswith("/42")
+            else [applied_rules]
+        )
+        return subprocess.CompletedProcess(args, 0, json.dumps(result), "")
+
+    provider = fuse_pr.GitHubCLI("example/project", tmp_path, runner=runner)
+    with pytest.raises(fuse_pr.ProviderError, match="bypass actors are unreadable"):
+        provider.branch_rules("main")
 
 
 def test_record_task_pr_persists_provider_number_base_and_head() -> None:
@@ -593,7 +867,9 @@ def merge_fixtures(
         "mergeable": "MERGEABLE",
         "mergeStateStatus": "CLEAN",
         "reviewDecision": "APPROVED",
-        "statusCheckRollup": [],
+        "statusCheckRollup": [
+            {"name": "tests", "status": "COMPLETED", "conclusion": "SUCCESS"}
+        ],
         "baseRefName": "main",
     }
     checks = {
@@ -695,7 +971,7 @@ def test_merge_candidate_requires_merged_prerequisites_in_current_base(
             check_evidence={},
             review_evidence={},
             unresolved_findings=[],
-            branch_rules=[{"type": "merge_queue"}],
+            branch_rules=strict_branch_rules(),
         )
 
     with pytest.raises(
@@ -758,7 +1034,9 @@ def test_merge_candidate_requires_merged_prerequisites_in_current_base(
         "mergeable": "MERGEABLE",
         "mergeStateStatus": "CLEAN",
         "reviewDecision": "APPROVED",
-        "statusCheckRollup": [],
+        "statusCheckRollup": [
+            {"name": "tests", "status": "COMPLETED", "conclusion": "SUCCESS"}
+        ],
         "baseRefName": "main",
     }
     provider.snapshot = target_pr
@@ -786,7 +1064,7 @@ def test_merge_candidate_requires_merged_prerequisites_in_current_base(
         check_evidence=checks,
         review_evidence=reviews,
         unresolved_findings=[],
-        branch_rules=[{"type": "merge_queue"}],
+        branch_rules=strict_branch_rules(),
     )
     assert decision.allowed is True
     provider.pr_snapshots[8]["mergeCommit"] = {"oid": base}
@@ -794,13 +1072,14 @@ def test_merge_candidate_requires_merged_prerequisites_in_current_base(
         fuse_pr.ProviderError,
         match="prerequisite PR 8 is no longer the validated merge",
     ):
-        fuse_pr.enqueue_merge(
+        fuse_pr.merge_pr(
             provider,
             number=7,
             expected_head_sha=target_head,
             decision=decision,
+            refresh_assessment=lambda: decision,
         )
-    assert provider.queued == []
+    assert provider.merged == []
 
 
 def test_merge_candidate_does_not_require_unrelated_pr_heads(tmp_path: Path) -> None:
@@ -821,7 +1100,7 @@ def test_merge_candidate_does_not_require_unrelated_pr_heads(tmp_path: Path) -> 
     assert candidate.head_shas == (target_head,)
 
 
-def test_merge_gate_requires_exact_candidate_all_reviews_and_merge_queue(
+def test_merge_gate_requires_exact_candidate_reviews_and_strict_protection(
     tmp_path: Path,
 ) -> None:
     root, _remote, base = init_repo(tmp_path)
@@ -836,7 +1115,7 @@ def test_merge_gate_requires_exact_candidate_all_reviews_and_merge_queue(
         check_evidence=checks,
         review_evidence=reviews,
         unresolved_findings=[],
-        branch_rules=[{"type": "merge_queue"}],
+        branch_rules=strict_branch_rules(),
     )
     assert blocked_without_binding.allowed is False
     assert (
@@ -854,12 +1133,12 @@ def test_merge_gate_requires_exact_candidate_all_reviews_and_merge_queue(
         check_evidence=checks,
         review_evidence=reviews,
         unresolved_findings=[],
-        branch_rules=[{"type": "merge_queue"}],
+        branch_rules=strict_branch_rules(),
     )
     assert decision.allowed is True
     assert decision.details["review_levels"] == list(fuse_pr.REQUIRED_REVIEW_LEVELS)
 
-    no_queue = fuse_pr.assess_merge(
+    no_protection = fuse_pr.assess_merge(
         pr,
         candidate,
         expected_base_sha=base,
@@ -870,8 +1149,191 @@ def test_merge_gate_requires_exact_candidate_all_reviews_and_merge_queue(
         unresolved_findings=[],
         branch_rules=[],
     )
-    assert no_queue.allowed is False
-    assert no_queue.reason == "atomic_merge_queue_unavailable"
+    assert no_protection.allowed is False
+    assert no_protection.reason == "strict_branch_protection_unavailable"
+
+
+@pytest.mark.parametrize(
+    "weakening",
+    [
+        "not_strict",
+        "second_check_rule_not_strict",
+        "missing_context",
+        "bypass_actor",
+        "unreadable_bypass_list",
+        "force_push",
+        "unknown_force_push_setting",
+        "delete",
+        "unknown_deletion_setting",
+        "invalid_review_count",
+        "merge_queue",
+    ],
+)
+def test_merge_gate_rejects_weakened_branch_protection(
+    tmp_path: Path, weakening: str
+) -> None:
+    root, _remote, base = init_repo(tmp_path)
+    head = commit_file(root, "feature.txt", "feature\n", "implement T1")
+    candidate, pr, checks, reviews = merge_fixtures(root, base, head)
+    rules = strict_branch_rules()
+    if weakening == "not_strict":
+        rules[1]["strict"] = False
+    elif weakening == "second_check_rule_not_strict":
+        rules.append(
+            {
+                "type": "required_status_checks",
+                "strict": False,
+                "contexts": ["deploy"],
+                "ruleset_id": 42,
+            }
+        )
+    elif weakening == "missing_context":
+        rules[1]["contexts"] = []
+    elif weakening == "bypass_actor":
+        rules[-1]["bypass_actors"] = [
+            {"actor_type": "RepositoryRole", "bypass_mode": "always"}
+        ]
+    elif weakening == "unreadable_bypass_list":
+        rules[-1]["bypass_actors"] = None
+    elif weakening == "force_push":
+        rules[2]["enabled"] = True
+    elif weakening == "unknown_force_push_setting":
+        rules[2]["enabled"] = None
+    elif weakening == "delete":
+        rules[3]["enabled"] = True
+    elif weakening == "unknown_deletion_setting":
+        rules[3]["enabled"] = None
+    elif weakening == "invalid_review_count":
+        rules[0]["required_approving_review_count"] = True
+    elif weakening == "merge_queue":
+        rules.append({"type": "merge_queue", "ruleset_id": 42})
+
+    decision = fuse_pr.assess_merge(
+        pr,
+        candidate,
+        provider=FakeProvider(),
+        expected_base_sha=base,
+        expected_head_sha=head,
+        required_checks=["tests"],
+        check_evidence=checks,
+        review_evidence=reviews,
+        unresolved_findings=[],
+        branch_rules=rules,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "strict_branch_protection_unavailable"
+
+
+def test_merge_gate_requires_every_protected_provider_check_to_pass(
+    tmp_path: Path,
+) -> None:
+    root, _remote, base = init_repo(tmp_path)
+    head = commit_file(root, "feature.txt", "feature\n", "implement T1")
+    candidate, pr, checks, reviews = merge_fixtures(root, base, head)
+    pr["statusCheckRollup"] = []
+
+    decision = fuse_pr.assess_merge(
+        pr,
+        candidate,
+        provider=FakeProvider(),
+        expected_base_sha=base,
+        expected_head_sha=head,
+        required_checks=["tests"],
+        check_evidence=checks,
+        review_evidence=reviews,
+        unresolved_findings=[],
+        branch_rules=strict_branch_rules(),
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "provider_required_check_missing_or_failed"
+
+
+def test_merge_gate_selects_only_a_method_allowed_by_repo_and_rulesets(
+    tmp_path: Path,
+) -> None:
+    root, _remote, base = init_repo(tmp_path)
+    head = commit_file(root, "feature.txt", "feature\n", "implement T1")
+    candidate, pr, checks, reviews = merge_fixtures(root, base, head)
+    provider = FakeProvider()
+    provider.merge_methods = ["squash", "rebase"]
+    rules = strict_branch_rules()
+    rules[0]["allowed_merge_methods"] = ["rebase"]
+
+    decision = fuse_pr.assess_merge(
+        pr,
+        candidate,
+        provider=provider,
+        expected_base_sha=base,
+        expected_head_sha=head,
+        required_checks=["tests"],
+        check_evidence=checks,
+        review_evidence=reviews,
+        unresolved_findings=[],
+        branch_rules=rules,
+    )
+
+    assert decision.allowed is True
+    assert decision.details["merge_method"] == "rebase"
+
+    provider.merge_methods = ["squash"]
+    blocked = fuse_pr.assess_merge(
+        pr,
+        candidate,
+        provider=provider,
+        expected_base_sha=base,
+        expected_head_sha=head,
+        required_checks=["tests"],
+        check_evidence=checks,
+        review_evidence=reviews,
+        unresolved_findings=[],
+        branch_rules=rules,
+    )
+
+    assert blocked.allowed is False
+    assert blocked.reason == "provider_has_no_compatible_merge_method"
+
+
+def test_merge_gate_requires_checks_from_every_applicable_ruleset(
+    tmp_path: Path,
+) -> None:
+    root, _remote, base = init_repo(tmp_path)
+    head = commit_file(root, "feature.txt", "feature\n", "implement T1")
+    candidate, pr, checks, reviews = merge_fixtures(root, base, head)
+    rules = strict_branch_rules()
+    rules.extend(
+        [
+            {
+                "type": "required_status_checks",
+                "strict": True,
+                "contexts": ["deploy"],
+                "ruleset_id": 43,
+            },
+            {
+                "type": "ruleset_bypass_actors",
+                "ruleset_id": 43,
+                "bypass_actors": [],
+                "active": True,
+            },
+        ]
+    )
+
+    decision = fuse_pr.assess_merge(
+        pr,
+        candidate,
+        provider=FakeProvider(),
+        expected_base_sha=base,
+        expected_head_sha=head,
+        required_checks=["tests"],
+        check_evidence=checks,
+        review_evidence=reviews,
+        unresolved_findings=[],
+        branch_rules=rules,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "provider_required_check_missing_or_failed"
 
 
 @pytest.mark.parametrize(
@@ -893,6 +1355,8 @@ def test_merge_gate_accepts_successful_github_check_rollup_shapes(
     head = commit_file(root, "feature.txt", "feature\n", "implement T1")
     candidate, pr, checks, reviews = merge_fixtures(root, base, head)
     pr["statusCheckRollup"] = [status_context]
+    context_name = status_context.get("context") or status_context.get("name")
+    assert isinstance(context_name, str)
 
     decision = fuse_pr.assess_merge(
         pr,
@@ -904,7 +1368,7 @@ def test_merge_gate_accepts_successful_github_check_rollup_shapes(
         check_evidence=checks,
         review_evidence=reviews,
         unresolved_findings=[],
-        branch_rules=[{"type": "merge_queue"}],
+        branch_rules=strict_branch_rules((context_name,)),
     )
 
     assert decision.allowed is True
@@ -957,13 +1421,13 @@ def test_merge_gate_refuses_stale_pending_or_unreviewed_candidates(
         check_evidence=checks,
         review_evidence=reviews,
         unresolved_findings=findings,
-        branch_rules=[{"type": "merge_queue"}],
+        branch_rules=strict_branch_rules(),
     )
     assert decision.allowed is False
     assert decision.reason == expected_reason
 
 
-def test_enqueue_rechecks_base_head_and_queue_before_any_provider_mutation(
+def test_direct_merge_rechecks_base_head_and_protection_before_mutation(
     tmp_path: Path,
 ) -> None:
     root, _remote, base = init_repo(tmp_path)
@@ -980,25 +1444,27 @@ def test_enqueue_rechecks_base_head_and_queue_before_any_provider_mutation(
         check_evidence=checks,
         review_evidence=reviews,
         unresolved_findings=[],
-        branch_rules=[{"type": "merge_queue"}],
+        branch_rules=strict_branch_rules(),
     )
     provider.snapshot = {**pr}
 
     assert (
-        fuse_pr.enqueue_merge(
+        fuse_pr.merge_pr(
             provider,
             number=7,
             expected_head_sha=head,
             decision=decision,
+            refresh_assessment=lambda: decision,
         )
-        == "queued"
+        == "merged"
     )
-    assert provider.queued == [
+    assert provider.merged == [
         {
             "number": 7,
             "candidate_sha": candidate.commit_sha,
             "base_sha": base,
             "head_sha": head,
+            "merge_method": "squash",
             "included_heads": (head,),
             "prerequisite_states": {},
             "required_checks": ("tests",),
@@ -1008,12 +1474,91 @@ def test_enqueue_rechecks_base_head_and_queue_before_any_provider_mutation(
         }
     ]
 
-    provider.snapshot = {**pr, "baseRefOid": "2" * 40}
-    with pytest.raises(fuse_pr.ProviderError, match="base moved"):
-        fuse_pr.enqueue_merge(
+    provider.rules = []
+    with pytest.raises(
+        fuse_pr.ProviderError, match="strict branch protection is missing"
+    ):
+        fuse_pr.merge_pr(
             provider,
             number=7,
             expected_head_sha=head,
             decision=decision,
+            refresh_assessment=lambda: decision,
         )
-    assert len(provider.queued) == 1
+    assert len(provider.merged) == 1
+
+    provider.rules = strict_branch_rules()
+    provider.snapshot = {**pr, "headRefOid": "3" * 40}
+    with pytest.raises(fuse_pr.ProviderError, match="head moved"):
+        fuse_pr.merge_pr(
+            provider,
+            number=7,
+            expected_head_sha=head,
+            decision=decision,
+            refresh_assessment=lambda: decision,
+        )
+    assert len(provider.merged) == 1
+
+    provider.snapshot = {**pr, "statusCheckRollup": []}
+    with pytest.raises(fuse_pr.ProviderError, match="required provider checks"):
+        fuse_pr.merge_pr(
+            provider,
+            number=7,
+            expected_head_sha=head,
+            decision=decision,
+            refresh_assessment=lambda: decision,
+        )
+    assert len(provider.merged) == 1
+
+    provider.snapshot = {**pr, "baseRefOid": "2" * 40}
+    with pytest.raises(fuse_pr.ProviderError, match="base moved"):
+        fuse_pr.merge_pr(
+            provider,
+            number=7,
+            expected_head_sha=head,
+            decision=decision,
+            refresh_assessment=lambda: decision,
+        )
+    assert len(provider.merged) == 1
+
+
+def test_direct_merge_refreshes_fuse_reviews_and_findings_before_mutation(
+    tmp_path: Path,
+) -> None:
+    root, _remote, base = init_repo(tmp_path)
+    head = commit_file(root, "feature.txt", "feature\n", "implement T1")
+    candidate, pr, checks, reviews = merge_fixtures(root, base, head)
+    provider = FakeProvider()
+    provider.snapshot = {**pr}
+    decision = fuse_pr.assess_merge(
+        pr,
+        candidate,
+        provider=provider,
+        expected_base_sha=base,
+        expected_head_sha=head,
+        required_checks=["tests"],
+        check_evidence=checks,
+        review_evidence=reviews,
+        unresolved_findings=[],
+        branch_rules=strict_branch_rules(),
+    )
+    updated_record_decision = fuse_pr.MergeDecision(
+        False,
+        "unresolved_review_findings",
+        candidate.commit_sha,
+        {"finding_ids": ["new-finding"]},
+    )
+
+    with pytest.raises(
+        fuse_pr.ProviderError,
+        match="current Fuse review/check evidence changed",
+    ):
+        fuse_pr.merge_pr(
+            provider,
+            number=7,
+            expected_head_sha=head,
+            decision=decision,
+            refresh_assessment=lambda: updated_record_decision,
+        )
+
+    assert provider.merged == []

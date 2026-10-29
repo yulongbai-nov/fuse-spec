@@ -192,7 +192,8 @@ def test_local_and_ci_refer_to_one_verification_entrypoint() -> None:
         encoding="utf-8"
     )
     assert "python skills/scripts/fuse_verify.py" in workflow
-    assert "merge_group:" in workflow
+    assert "pull_request:" in workflow
+    assert "merge_group:" not in workflow
     assert "permissions:\n  contents: read" in workflow
     assert "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1" in workflow
     assert "actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0" in workflow
