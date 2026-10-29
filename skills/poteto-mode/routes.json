@@ -1,0 +1,105 @@
+{
+  "schema_version": 1,
+  "decision_contract": {
+    "rationale_max_chars": 500,
+    "evidence_ref_prefix": "source:",
+    "evidence_ref_policy": "exact task impl reference or existing repository-relative file",
+    "classification_policy": "model judgment; reviewers audit substance without keyword matching"
+  },
+  "routes": [
+    {
+      "method": "Feature",
+      "playbook": "feature.md",
+      "when": "The approved task adds behavior or capability."
+    },
+    {
+      "method": "Bug Fix",
+      "playbook": "bug-fix.md",
+      "when": "Existing behavior fails an approved requirement or documented expectation."
+    },
+    {
+      "method": "Refactoring",
+      "playbook": "refactoring.md",
+      "when": "The approved task changes structure while preserving externally observable behavior."
+    },
+    {
+      "method": "Performance Issue",
+      "conditional": true,
+      "playbook": "performance-issue.md",
+      "when": "The approved task includes a measurable performance goal.",
+      "evidence": ["baseline", "post_change"]
+    },
+    {
+      "method": "Runtime/Trace Forensics",
+      "conditional": true,
+      "when": "The approved task diagnoses behavior from a live process or an existing diagnostic artifact.",
+      "source_routes": {
+        "live_process": "live-process-forensics.md",
+        "existing_trace": "trace-forensics.md"
+      }
+    },
+    {
+      "method": "Prototype",
+      "conditional": true,
+      "playbook": "prototype.md",
+      "when": "An approved design question can be answered by an isolated, disposable experiment.",
+      "isolated": true
+    },
+    {
+      "method": "Visual Parity",
+      "conditional": true,
+      "playbook": "visual-parity.md",
+      "when": "An approved requirement calls for exact visual equivalence.",
+      "requires_exact_visual_requirement": true
+    }
+  ],
+  "scenarios": [
+    {
+      "scenario": "new_behavior",
+      "method": "Feature",
+      "playbook": "feature.md"
+    },
+    {
+      "scenario": "broken_existing_behavior",
+      "method": "Bug Fix",
+      "playbook": "bug-fix.md"
+    },
+    {
+      "scenario": "preserve_behavior_restructure",
+      "method": "Refactoring",
+      "playbook": "refactoring.md"
+    },
+    {
+      "scenario": "approved_measurable_performance_goal",
+      "method": "Performance Issue",
+      "playbook": "performance-issue.md"
+    },
+    {
+      "scenario": "diagnose_accessible_live_process",
+      "method": "Runtime/Trace Forensics",
+      "playbook": "live-process-forensics.md"
+    },
+    {
+      "scenario": "diagnose_existing_trace",
+      "method": "Runtime/Trace Forensics",
+      "playbook": "trace-forensics.md"
+    },
+    {
+      "scenario": "approved_observable_design_question",
+      "method": "Prototype",
+      "playbook": "prototype.md"
+    },
+    {
+      "scenario": "approved_exact_visual_equivalence",
+      "method": "Visual Parity",
+      "playbook": "visual-parity.md"
+    }
+  ],
+  "research": {
+    "phase": "research",
+    "method": null,
+    "note": "Use Fuse's existing read-only research phase; do not dispatch an Investigation method."
+  },
+  "excluded_methods": ["Investigation"],
+  "deferred_methods": ["Hillclimb"]
+}

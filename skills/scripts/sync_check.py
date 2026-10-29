@@ -1,38 +1,23 @@
 #!/usr/bin/env python3
-"""Validate traceability across a spec's three files.
+"""Validate traceability across a spec's requirements, design, and tasks.
 
-Given a spec directory containing requirements.md (or bugfix.md), design.md,
-and tasks.md, this checks that every cross-reference resolves and reports
-orphans. It is deterministic and token-free; the agent does the semantic pass
-on whatever this flags.
+Given a spec directory, this checks that every cross-reference resolves and
+reports orphaned declarations.
 
 Reference model
----------------
-requirements.md : declares requirement ids via headings  "### R1 ..." / "#### R1: ..."
-                  (bugfix.md declares them the same way)
-design.md       : declares design anchors via headings    "### D-Auth ..."
-                  and cites requirements via lines         "satisfies: R1, R2"
-tasks.md        : each task carries an inline tag          "[id:T3 deps:T1,T2 impl:R2,D-Auth]"
+--------------
+requirements.md (or bugfix.md): requirement headings such as ``### R1 ...``
+design.md: design anchors such as ``### D-Auth ...`` and ``satisfies: R1``
+tasks.md: inline tags such as ``[id:T3 deps:T1 impl:R2,D-Auth]``
 
-Findings
---------
-ERROR (exit 1): a reference points at something that does not exist
-    - task impl cites an R-id absent from requirements
-    - task impl cites a D-anchor absent from design
-    - task deps cites an unknown task id
-    - design satisfies cites an R-id absent from requirements
-WARN  (exit 0 if no errors): something is orphaned / likely stale
-    - requirement satisfied by no design section
-    - design anchor referenced by no task
-    - design section with an empty/missing satisfies list
-    - task with an empty impl list
-
-Usage:
-    sync_check.py <spec-dir>
+Errors exit 1; warnings exit 0. A missing or empty requirements input is an
+error because traceability cannot be checked without at least one requirement.
 """
+
 import argparse
 import re
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 HEADING_R = re.compile(r"^#{1,6}\s*(R\d+)\b")
@@ -41,42 +26,46 @@ SATISFIES = re.compile(r"satisfies:\s*([^\n]+)", re.IGNORECASE)
 TASK_TAG = re.compile(r"\[([^\]]*\bid:[^\]]*)\]")
 R_REF = re.compile(r"\bR\d+\b")
 D_REF = re.compile(r"\bD-[\w-]+\b")
-T_REF = re.compile(r"\bT\d+\b")
 
 
 def read(path: Path) -> str:
+    """Read an existing UTF-8 file, returning an empty string if absent."""
     return path.read_text(encoding="utf-8") if path.is_file() else ""
 
 
 def strip_fences(text: str) -> str:
-    """Drop fenced ``` code blocks so documentation examples aren't parsed."""
-    out = []
+    """Drop fenced code blocks so documentation examples are not parsed."""
+    lines: list[str] = []
     in_fence = False
     for line in text.splitlines():
         if line.lstrip().startswith("```"):
             in_fence = not in_fence
             continue
         if not in_fence:
-            out.append(line)
-    return "\n".join(out)
+            lines.append(line)
+    return "\n".join(lines)
 
 
-def parse_tag(body: str) -> dict:
-    """Tokenize 'id:T3 deps:T1,T2 impl:R2,D-Auth' into {id, deps[], impl[]}."""
-    fields = {}
+def parse_tag(body: str) -> tuple[str | None, list[str], list[str]]:
+    """Parse an inline task tag into its id, dependencies, and references."""
+    task_id: str | None = None
+    deps: list[str] = []
+    impl: list[str] = []
     for token in body.split():
         if ":" not in token:
             continue
         key, _, raw = token.partition(":")
         key = key.strip()
         if key == "id":
-            fields["id"] = raw.strip()
-        elif key in ("deps", "impl"):
-            fields[key] = [x for x in re.split(r"[,]+", raw) if x]
-    return fields
+            task_id = raw.strip()
+        elif key == "deps":
+            deps = [value for value in raw.split(",") if value]
+        elif key == "impl":
+            impl = [value for value in raw.split(",") if value]
+    return task_id, deps, impl
 
 
-def main(argv=None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Validate spec traceability.")
     parser.add_argument("spec_dir", help="path to .specs/NNN-<slug>/")
     args = parser.parse_args(argv)
@@ -89,97 +78,129 @@ def main(argv=None) -> int:
     req_path = spec / "requirements.md"
     if not req_path.is_file():
         req_path = spec / "bugfix.md"
+    if not req_path.is_file():
+        print(
+            "ERROR: missing requirements input: expected requirements.md or bugfix.md"
+        )
+        return 1
+
+    req_text = strip_fences(read(req_path))
+    if not req_text.strip():
+        print(f"ERROR: requirements input is empty: {req_path.name}")
+        return 1
+
+    req_ids = {
+        match.group(1)
+        for line in req_text.splitlines()
+        if (match := HEADING_R.match(line))
+    }
+    if not req_ids:
+        print(f"ERROR: no requirement IDs found in {req_path.name}")
+        return 1
+
     design_text = strip_fences(read(spec / "design.md"))
     tasks_text = strip_fences(read(spec / "tasks.md"))
-    req_text = strip_fences(read(req_path))
 
-    # Defined ids
-    req_ids = {m.group(1) for line in req_text.splitlines() if (m := HEADING_R.match(line))}
-    design_anchors = {m.group(1) for line in design_text.splitlines() if (m := HEADING_D.match(line))}
+    design_anchors = {
+        match.group(1)
+        for line in design_text.splitlines()
+        if (match := HEADING_D.match(line))
+    }
+
+    design_satisfies: set[str] = set()
+    design_section_count = sum(
+        1 for line in design_text.splitlines() if HEADING_D.match(line)
+    )
+    for match in SATISFIES.finditer(design_text):
+        design_satisfies.update(R_REF.findall(match.group(1)))
+    satisfies_line_count = len(SATISFIES.findall(design_text))
+    missing_satisfies_count = max(0, design_section_count - satisfies_line_count)
+
+    task_ids: set[str] = set()
+    task_deps: dict[str, list[str]] = {}
+    task_impl: dict[str, list[str]] = {}
+    duplicate_task_ids: set[str] = set()
+    tasks_without_impl: list[str] = []
+    for match in TASK_TAG.finditer(tasks_text):
+        task_id, deps, impl = parse_tag(match.group(1))
+        if not task_id:
+            continue
+        if task_id in task_ids:
+            duplicate_task_ids.add(task_id)
+        task_ids.add(task_id)
+        task_deps[task_id] = deps
+        task_impl[task_id] = impl
+        if not impl:
+            tasks_without_impl.append(task_id)
+
+    errors: list[str] = [
+        f"duplicate task id {task_id}" for task_id in sorted(duplicate_task_ids)
+    ]
+    warnings: list[str] = []
 
     # Design -> requirements
-    design_satisfies = set()
-    design_sections_without_satisfies = 0
-    design_section_count = 0
-    for line in design_text.splitlines():
-        if HEADING_D.match(line):
-            design_section_count += 1
-    for m in SATISFIES.finditer(design_text):
-        refs = R_REF.findall(m.group(1))
-        design_satisfies.update(refs)
-    # sections that declare an anchor but never appear with a satisfies nearby:
-    # approximate by comparing counts (anchors vs satisfies lines)
-    satisfies_line_count = len(SATISFIES.findall(design_text))
-    if design_section_count and satisfies_line_count < design_section_count:
-        design_sections_without_satisfies = design_section_count - satisfies_line_count
+    for reference in sorted(design_satisfies):
+        if reference not in req_ids:
+            errors.append(
+                f"design.md satisfies cites {reference} but it is not defined "
+                f"in {req_path.name}"
+            )
 
-    # Tasks
-    task_ids = set()
-    task_deps = {}
-    task_impl = {}
-    tasks_without_impl = []
-    for m in TASK_TAG.finditer(tasks_text):
-        tag = parse_tag(m.group(1))
-        tid = tag.get("id")
-        if not tid:
-            continue
-        task_ids.add(tid)
-        task_deps[tid] = tag.get("deps", [])
-        impl = tag.get("impl", [])
-        task_impl[tid] = impl
-        if not impl:
-            tasks_without_impl.append(tid)
-
-    errors = []
-    warnings = []
-
-    # ERROR: design satisfies cites unknown R-id
-    for ref in sorted(design_satisfies):
-        if ref not in req_ids:
-            errors.append(f"design.md satisfies cites {ref} but it is not defined in {req_path.name}")
-
-    # Tasks
-    impl_r_refs = set()
-    impl_d_refs = set()
-    for tid in sorted(task_ids):
-        for ref in task_impl.get(tid, []):
-            if R_REF.fullmatch(ref):
-                impl_r_refs.add(ref)
-                if ref not in req_ids:
-                    errors.append(f"task {tid} impl cites {ref} but it is not defined in {req_path.name}")
-            elif D_REF.fullmatch(ref):
-                impl_d_refs.add(ref)
-                if ref not in design_anchors:
-                    errors.append(f"task {tid} impl cites {ref} but it is not defined in design.md")
+    # Task traceability and dependency declarations
+    impl_r_refs: set[str] = set()
+    impl_d_refs: set[str] = set()
+    for task_id in sorted(task_ids):
+        for reference in task_impl.get(task_id, []):
+            if R_REF.fullmatch(reference):
+                impl_r_refs.add(reference)
+                if reference not in req_ids:
+                    errors.append(
+                        f"task {task_id} impl cites {reference} but it is not "
+                        f"defined in {req_path.name}"
+                    )
+            elif D_REF.fullmatch(reference):
+                impl_d_refs.add(reference)
+                if reference not in design_anchors:
+                    errors.append(
+                        f"task {task_id} impl cites {reference} but it is not "
+                        "defined in design.md"
+                    )
             else:
-                warnings.append(f"task {tid} impl has unrecognized reference '{ref}' (expected R<n> or D-<name>)")
-        for dep in task_deps.get(tid, []):
-            if dep not in task_ids:
-                errors.append(f"task {tid} deps cites unknown task {dep}")
+                warnings.append(
+                    f"task {task_id} impl has unrecognized reference "
+                    f"'{reference}' (expected R<n> or D-<name>)"
+                )
+        for dependency in task_deps.get(task_id, []):
+            if dependency not in task_ids:
+                errors.append(f"task {task_id} deps cites unknown task {dependency}")
 
     # WARN: requirement satisfied by nothing (neither design nor any task)
-    for rid in sorted(req_ids):
-        if rid not in design_satisfies and rid not in impl_r_refs:
-            warnings.append(f"requirement {rid} is satisfied by no design section and implemented by no task")
+    for requirement_id in sorted(req_ids):
+        if requirement_id not in design_satisfies and requirement_id not in impl_r_refs:
+            warnings.append(
+                f"requirement {requirement_id} is satisfied by no design section "
+                "and implemented by no task"
+            )
 
     # WARN: design anchor referenced by no task
     for anchor in sorted(design_anchors):
         if anchor not in impl_d_refs:
             warnings.append(f"design anchor {anchor} is referenced by no task")
 
-    # WARN: design sections without a satisfies line
-    if design_sections_without_satisfies:
+    if missing_satisfies_count:
         warnings.append(
-            f"{design_sections_without_satisfies} design section(s) appear to have no 'satisfies:' line")
+            f"{missing_satisfies_count} design section(s) appear to have no "
+            "'satisfies:' line"
+        )
+    for task_id in tasks_without_impl:
+        warnings.append(
+            f"task {task_id} has an empty impl list (no requirement/design reference)"
+        )
 
-    # WARN: tasks without impl
-    for tid in tasks_without_impl:
-        warnings.append(f"task {tid} has an empty impl list (no requirement/design reference)")
-
-    for w in warnings:
-        print(f"WARN: {w}")
-    for e in errors:
-        print(f"ERROR: {e}")
+    for warning in warnings:
+        print(f"WARN: {warning}")
+    for error in errors:
+        print(f"ERROR: {error}")
 
     if not errors and not warnings:
         print("OK: traceability is consistent")

@@ -9,9 +9,11 @@ Usage:
 
 Prints e.g. "004-token-rotation" to stdout.
 """
+
 import argparse
 import re
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 NAME_RE = re.compile(r"^(\d{3,})-")
@@ -35,10 +37,14 @@ def next_number(specs_dir: Path) -> int:
     return highest + 1
 
 
-def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="Print next NNN-<slug> spec folder name.")
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Print next NNN-<slug> spec folder name."
+    )
     parser.add_argument("slug", help="feature slug (will be slugified)")
-    parser.add_argument("--specs-dir", default=".specs", help="specs directory (default: .specs)")
+    parser.add_argument(
+        "--specs-dir", default=".specs", help="specs directory (default: .specs)"
+    )
     args = parser.parse_args(argv)
 
     slug = slugify(args.slug)

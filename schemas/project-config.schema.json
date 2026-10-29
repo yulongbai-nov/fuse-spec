@@ -1,0 +1,254 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fuse-spec.local/schemas/project-config.schema.json",
+  "title": "Fuse project configuration",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "roles",
+    "limits",
+    "budgets",
+    "overrides",
+    "toolchain",
+    "checks"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "roles": {
+      "type": "object",
+      "required": ["manager", "worker", "reviewer", "rca", "rca_reviewer"],
+      "properties": {
+        "manager": { "$ref": "#/$defs/roleProfile" },
+        "worker": { "$ref": "#/$defs/roleProfile" },
+        "reviewer": { "$ref": "#/$defs/roleProfile" },
+        "rca": { "$ref": "#/$defs/roleProfile" },
+        "rca_reviewer": { "$ref": "#/$defs/roleProfile" }
+      },
+      "additionalProperties": false
+    },
+    "limits": {
+      "type": "object",
+      "required": ["review", "rca", "concurrency", "checks"],
+      "properties": {
+        "review": {
+          "type": "object",
+          "required": ["max_repair_rounds_per_level"],
+          "properties": {
+            "max_repair_rounds_per_level": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false
+        },
+        "rca": {
+          "type": "object",
+          "required": ["attempts_per_hard_blocker"],
+          "properties": {
+            "attempts_per_hard_blocker": { "type": "integer", "minimum": 0 }
+          },
+          "additionalProperties": false
+        },
+        "concurrency": {
+          "type": "object",
+          "required": [
+            "ordinary_luna_max_floor",
+            "other_profile_default"
+          ],
+          "properties": {
+            "ordinary_luna_max_floor": { "type": "integer", "minimum": 1 },
+            "other_profile_default": { "type": "integer", "minimum": 1 }
+          },
+          "additionalProperties": false
+        },
+        "checks": {
+          "type": "object",
+          "required": ["timeout_seconds", "max_output_bytes_per_stream"],
+          "properties": {
+            "timeout_seconds": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "max_output_bytes_per_stream": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "budgets": {
+      "type": "object",
+      "required": ["elapsed_time_seconds", "model_usage"],
+      "properties": {
+        "elapsed_time_seconds": {
+          "oneOf": [
+            { "const": "unset" },
+            { "type": "integer", "minimum": 1 }
+          ]
+        },
+        "model_usage": {
+          "type": "object",
+          "required": ["limit", "unit"],
+          "properties": {
+            "limit": {
+              "oneOf": [
+                { "const": "unset" },
+                { "type": "number", "exclusiveMinimum": 0 }
+              ]
+            },
+            "unit": { "type": "string", "minLength": 1, "pattern": "\\S" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "overrides": {
+      "type": "object",
+      "required": ["allowed_fields", "bounds"],
+      "properties": {
+        "allowed_fields": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "pattern": "\\S" },
+          "uniqueItems": true
+        },
+        "bounds": {
+          "type": "object",
+          "patternProperties": {
+            "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$": {
+              "$ref": "#/$defs/numericBound"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "toolchain": {
+      "type": "object",
+      "required": [
+        "runtime",
+        "runtime_version",
+        "runtime_file",
+        "package_manager",
+        "manifest",
+        "lockfile",
+        "selection_policy",
+        "restore_policy",
+        "allow_new_package_manager",
+        "modify_consumer_package_files"
+      ],
+      "properties": {
+        "runtime": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "runtime_version": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "runtime_file": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "package_manager": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "manifest": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "lockfile": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "selection_policy": { "const": "reuse_existing" },
+        "restore_policy": {
+          "const": "selected_tools_existing_version_and_lock_only"
+        },
+        "allow_new_package_manager": { "const": false },
+        "modify_consumer_package_files": { "const": false }
+      },
+      "additionalProperties": false
+    },
+    "checks": {
+      "type": "object",
+      "minProperties": 1,
+      "patternProperties": {
+        "^[a-z][a-z0-9_-]*$": { "$ref": "#/$defs/check" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "roleProfile": {
+      "type": "object",
+      "required": [
+        "model",
+        "reasoning_effort",
+        "required_tools",
+        "unavailable_policy",
+        "fallback_roles"
+      ],
+      "properties": {
+        "model": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "reasoning_effort": {
+          "enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
+        },
+        "required_tools": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1, "pattern": "\\S" },
+          "uniqueItems": true
+        },
+        "unavailable_policy": { "enum": ["block", "fallback"] },
+        "fallback_roles": {
+          "type": "array",
+          "items": {
+            "enum": ["manager", "worker", "reviewer", "rca", "rca_reviewer"]
+          },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "numericBound": {
+      "type": "object",
+      "required": ["value_type"],
+      "properties": {
+        "minimum": { "type": "integer", "minimum": 0 },
+        "maximum": { "type": "integer", "minimum": 0 },
+        "value_type": { "enum": ["integer", "number"] }
+      },
+      "anyOf": [{ "required": ["minimum"] }, { "required": ["maximum"] }],
+      "additionalProperties": false
+    },
+    "check": {
+      "type": "object",
+      "required": ["command", "prerequisites", "inputs", "pass_criteria"],
+      "properties": {
+        "command": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1, "pattern": "\\S" }
+        },
+        "prerequisites": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[a-z][a-z0-9_-]*$" },
+          "uniqueItems": true
+        },
+        "inputs": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1, "pattern": "\\S" },
+          "uniqueItems": true
+        },
+        "pass_criteria": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
