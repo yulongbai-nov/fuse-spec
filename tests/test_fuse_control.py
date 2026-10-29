@@ -562,8 +562,60 @@ def test_rca_fix_requires_separate_rca_review_after_later_worker_changes(
     assert record["review_counters"][0]["repairs_used"] == 2
 
 
+def test_rca_result_before_isolated_commit_integration_retains_review_obligation(
+    gate_scenario: GateScenario,
+) -> None:
+    """A coordinator snapshot cannot prove that an isolated RCA returned no code."""
+    scenario = gate_scenario
+    scenario.finish(scenario.start("worker"))
+    record = scenario.record()
+    finding = fuse_record.add_finding(record, "T1", "Hard blocker in isolated work")
+    fuse_state.save_run(scenario.root, record)
+    rca = scenario.start("rca", finding_id=finding["id"])
+    worker_root = scenario.root.parent / "rca-worker"
+    git(scenario.root, "worktree", "add", "--detach", str(worker_root), "HEAD")
+    try:
+        (worker_root / "app.py").write_text("value = 2\n")
+        git(worker_root, "add", "app.py")
+        git(worker_root, "commit", "--quiet", "-m", "Isolated RCA fix")
+        returned_commit = git(worker_root, "rev-parse", "HEAD")
+        scenario.call(
+            "record-result",
+            "--assignment-id",
+            rca["assignment_id"],
+            "--attempt-id",
+            rca["attempt_id"],
+            "--outcome",
+            "succeeded",
+            "--summary",
+            f"RCA fix returned at {returned_commit}",
+        )
+        before_integration = scenario.record()["assignments"][-1]["attempts"][-1]
+        result = before_integration["result"]
+        assert result["rca_base_candidate_id"] == result["rca_candidate_id"]
+        assert (scenario.root / "app.py").read_text() == "value = 1\n"
+        assert fuse_control.rca_review_attempt_ids(scenario.record(), "T1") == [
+            rca["attempt_id"]
+        ]
+        git(scenario.root, "cherry-pick", returned_commit)
+    finally:
+        git(scenario.root, "worktree", "remove", str(worker_root))
+    scenario.call("resume")
+    scenario.check()
+    scenario.review(resolve=finding["id"])
+    refused = scenario.call("accept", "--task-id", "T1", allowed=False)
+    assert refused["reason"] == "rca_review_evidence_missing"
+    assert refused["details"]["rca_attempt_ids"] == [rca["attempt_id"]]
+    before_review = scenario.record()
+    scenario.review("rca_reviewer")
+    scenario.call("accept", "--task-id", "T1")
+    after_review = scenario.record()
+    assert after_review["review_counters"] == before_review["review_counters"]
+    assert after_review["rca_attempts"] == before_review["rca_attempts"]
+
+
 @pytest.mark.parametrize("changes_candidate", [False, True])
-def test_rca_review_is_additional_and_unchanged_rca_does_not_create_obligation(
+def test_rca_review_is_additional_even_when_coordinator_candidate_is_unchanged(
     gate_scenario: GateScenario, changes_candidate: bool
 ) -> None:
     scenario = gate_scenario
@@ -583,7 +635,10 @@ def test_rca_review_is_additional_and_unchanged_rca_does_not_create_obligation(
         scenario.review()
     else:
         scenario.review(resolve=finding["id"])
-        assert fuse_control.rca_review_attempt_ids(scenario.record(), "T1") == []
+        refused = scenario.call("accept", "--task-id", "T1", allowed=False)
+        assert refused["reason"] == "rca_review_evidence_missing"
+        assert refused["details"]["rca_attempt_ids"] == [rca["attempt_id"]]
+        scenario.review("rca_reviewer")
     scenario.call("accept", "--task-id", "T1")
     assert scenario.record()["rca_attempts"][0]["attempts_used"] == 1
 

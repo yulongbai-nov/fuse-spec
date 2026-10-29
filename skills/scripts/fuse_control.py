@@ -429,12 +429,10 @@ def rca_review_attempt_ids(record: Mapping[str, Any], task_id: str) -> list[str]
         for attempt in assignment["attempts"]:
             if attempt["status"] not in fuse_record.TERMINAL_ATTEMPT_STATES:
                 continue
-            result = attempt.get("result", {})
-            baseline = result.get("rca_base_candidate_id")
-            candidate = result.get("rca_candidate_id")
-            # Older records cannot establish that RCA left the candidate intact.
-            if baseline is None or candidate is None or baseline != candidate:
-                required.append(str(attempt["id"]))
+            # Result snapshots describe the coordinator, which may not have
+            # integrated the worker's isolated commit yet. Without immutable
+            # returned-code and integration proof, no-code claims are unverified.
+            required.append(str(attempt["id"]))
     return required
 
 
