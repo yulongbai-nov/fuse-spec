@@ -9,6 +9,10 @@ from pathlib import Path
 
 import pytest
 
+SCRIPT_DIR = Path(__file__).parents[1] / "skills" / "scripts"
+sys.path.insert(0, str(SCRIPT_DIR))
+import plan_waves  # noqa: E402
+
 SCRIPT = Path(__file__).parents[1] / "skills" / "scripts" / "plan_waves.py"
 
 
@@ -102,6 +106,34 @@ def test_overlapping_write_scopes_are_serialized(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     waves = json.loads(result.stdout)["waves"]
     assert waves == [["T1"], ["T2"]]
+
+
+def test_public_task_parser_reuses_markdown_files_syntax() -> None:
+    parsed, duplicates, done = plan_waves.parse_task_declarations(
+        """\
+- [ ] T7 Example [id:T7 deps:T5 impl:R1]
+    - **Files:** `tests/test_pr_provider.py`, src/other.py
+- [ ] T8 Example [id:T8 deps:T5 impl:R1]
+    - **Files:** `tests/`
+"""
+    )
+
+    assert parsed == {
+        "T7": {
+            "deps": ["T5"],
+            "impl": ["R1"],
+            "writes": ["tests/test_pr_provider.py", "src/other.py"],
+            "scope_invalid": False,
+        },
+        "T8": {
+            "deps": ["T5"],
+            "impl": ["R1"],
+            "writes": ["tests"],
+            "scope_invalid": False,
+        },
+    }
+    assert duplicates == set()
+    assert done == set()
 
 
 def test_disjoint_write_scopes_remain_parallel(tmp_path: Path) -> None:

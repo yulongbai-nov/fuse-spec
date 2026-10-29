@@ -158,6 +158,40 @@ def test_retry_appends_new_attempt_and_preserves_terminal_history() -> None:
         fuse_record.validate_run_record(record, previous=before_retry)
 
 
+def test_reviewer_candidate_context_survives_result_and_retry() -> None:
+    record = make_record()
+    candidate = fuse_record.add_candidate(record, {"verification": "fixed"})
+    assignment = fuse_record.prepare_assignment(
+        record,
+        "T1",
+        "Review",
+        "reviewer",
+        review_candidate_id=candidate["candidate_id"],
+    )
+    attempt = assignment["attempts"][0]
+    assert attempt["result"]["candidate_id"] == candidate["candidate_id"]
+    fuse_record.bind_launch(record, assignment["id"], attempt["id"], "reviewer-1")
+    with pytest.raises(fuse_record.RecordError, match="candidate_id cannot change"):
+        fuse_record.record_attempt_result(
+            record,
+            assignment["id"],
+            attempt["id"],
+            "succeeded",
+            {"candidate_id": "0" * 64},
+        )
+    fuse_record.record_attempt_result(
+        record,
+        assignment["id"],
+        attempt["id"],
+        "failed",
+        {"summary": "review invocation failed"},
+    )
+    retried = fuse_record.append_retry(record, assignment["id"])
+    assert (
+        retried["attempts"][-1]["result"]["candidate_id"] == candidate["candidate_id"]
+    )
+
+
 def test_retry_is_rejected_when_another_assignment_for_the_task_is_active() -> None:
     record = make_record()
     first = fuse_record.prepare_assignment(record, "T1", "Feature", "worker")

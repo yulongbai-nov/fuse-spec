@@ -129,6 +129,19 @@ def _semantic_errors(record: Mapping[str, Any]) -> list[str]:
                 if host_handle in host_handles:
                     errors.append(f"duplicate host handle: {host_handle}")
                 host_handles.add(host_handle)
+            result = attempt.get("result", {})
+            if isinstance(result, Mapping):
+                candidate_id = result.get("candidate_id")
+                if candidate_id is not None and candidate_id not in candidate_ids:
+                    errors.append(
+                        f"attempt {attempt_id} references unknown candidate "
+                        f"{candidate_id}"
+                    )
+                finding_id = result.get("finding_id")
+                if finding_id is not None and finding_id not in finding_ids:
+                    errors.append(
+                        f"attempt {attempt_id} references unknown finding {finding_id}"
+                    )
 
     task_assignment_ids: set[str] = set()
     for task_id, task_state in tasks.items():
@@ -278,6 +291,18 @@ def _validate_history(previous: Mapping[str, Any], current: Mapping[str, Any]) -
         ):
             raise RecordError("cannot retry while the previous attempt is unresolved")
         for old_attempt, new_attempt in zip(old_attempts, new_attempts):
+            old_result = old_attempt.get("result", {})
+            new_result = new_attempt.get("result", {})
+            for field in ("candidate_id", "finding_id"):
+                if (
+                    isinstance(old_result, Mapping)
+                    and field in old_result
+                    and (
+                        not isinstance(new_result, Mapping)
+                        or new_result.get(field) != old_result[field]
+                    )
+                ):
+                    raise RecordError(f"attempt dispatch {field} is immutable")
             old_host_handle = old_attempt.get("host_handle")
             if (
                 old_host_handle is not None
@@ -443,6 +468,8 @@ def prepare_assignment(
     role_profile: str,
     *,
     capacity: int = 1,
+    review_candidate_id: str | None = None,
+    finding_id: str | None = None,
 ) -> dict[str, Any]:
     """Persist an assignment and reserve capacity before any host launch."""
     if any(
@@ -452,7 +479,24 @@ def prepare_assignment(
         raise RecordError(f"task {task_id} already has an unresolved assignment")
     now = _now()
     assignment_id = _new_id("asg")
-    attempt = {"id": _new_id("att"), "status": "prepared", "created_at": now}
+    attempt: dict[str, Any] = {
+        "id": _new_id("att"),
+        "status": "prepared",
+        "created_at": now,
+    }
+    dispatch_context: dict[str, Any] = {}
+    if review_candidate_id is not None:
+        if review_candidate_id not in {
+            item["candidate_id"] for item in record["candidates"]
+        }:
+            raise RecordError("review dispatch candidate is not persisted")
+        dispatch_context["candidate_id"] = review_candidate_id
+    if finding_id is not None:
+        if finding_id not in {item["id"] for item in record["findings"]}:
+            raise RecordError("dispatch finding does not exist")
+        dispatch_context["finding_id"] = finding_id
+    if dispatch_context:
+        attempt["result"] = dispatch_context
     assignment = {
         "id": assignment_id,
         "task_id": task_id,
@@ -539,9 +583,18 @@ def record_attempt_result(
         raise RecordError(
             f"attempt cannot transition from {current_status} to {outcome}"
         )
+    existing_result = attempt.get("result", {})
+    if not isinstance(existing_result, Mapping):
+        raise RecordError("attempt dispatch context must be an object")
+    result_data = copy.deepcopy(dict(existing_result))
+    for key, value in (result or {}).items():
+        if key in {"candidate_id", "finding_id"} and key in result_data:
+            if result_data[key] != value:
+                raise RecordError(f"attempt {key} cannot change after dispatch")
+        result_data[key] = copy.deepcopy(value)
+    if result is not None or result_data:
+        attempt["result"] = result_data
     attempt["status"] = outcome
-    if result is not None:
-        attempt["result"] = copy.deepcopy(dict(result))
     assignment["status"] = outcome
     assignment["reservation_active"] = outcome in RESERVED_ATTEMPT_STATES
     if outcome in RESERVED_ATTEMPT_STATES:
@@ -571,7 +624,20 @@ def append_retry(record: dict[str, Any], assignment_id: str) -> dict[str, Any]:
         raise RecordError(
             f"task {assignment['task_id']} already has an active assignment"
         )
-    attempt = {"id": _new_id("att"), "status": "prepared", "created_at": _now()}
+    attempt: dict[str, Any] = {
+        "id": _new_id("att"),
+        "status": "prepared",
+        "created_at": _now(),
+    }
+    latest_result = assignment["attempts"][-1].get("result", {})
+    dispatch_context: dict[str, Any] = {}
+    if isinstance(latest_result, Mapping):
+        if assignment["method"] == "Review" and "candidate_id" in latest_result:
+            dispatch_context["candidate_id"] = latest_result["candidate_id"]
+        if "finding_id" in latest_result:
+            dispatch_context["finding_id"] = latest_result["finding_id"]
+    if dispatch_context:
+        attempt["result"] = copy.deepcopy(dispatch_context)
     assignment["attempts"].append(attempt)
     assignment["status"] = "prepared"
     assignment["reservation_active"] = True
@@ -589,6 +655,55 @@ def reserved_capacity(record: Mapping[str, Any]) -> int:
     )
 
 
+def reserve_task_repair(
+    record: dict[str, Any], task_id: str, limit: int
+) -> dict[str, Any]:
+    """Consume one task-review repair when its assignment is reserved."""
+    counter = next(
+        (
+            item
+            for item in record["review_counters"]
+            if item["scope_id"] == task_id and item["level"] == "task"
+        ),
+        None,
+    )
+    if counter is None:
+        counter = {
+            "scope_id": task_id,
+            "level": "task",
+            "repairs_used": 0,
+            "limit": limit,
+        }
+        record["review_counters"].append(counter)
+    elif counter["limit"] != limit:
+        raise RecordError("task repair counter limit differs from policy snapshot")
+    if counter["repairs_used"] >= counter["limit"]:
+        raise RecordError(f"task repair limit reached for {task_id}")
+    counter["repairs_used"] += 1
+    validate_run_record(record)
+    return counter
+
+
+def reserve_rca_attempt(
+    record: dict[str, Any], finding_id: str, limit: int
+) -> dict[str, Any]:
+    """Consume one RCA allowance when its finding-specific assignment is reserved."""
+    counter = next(
+        (item for item in record["rca_attempts"] if item["finding_id"] == finding_id),
+        None,
+    )
+    if counter is None:
+        counter = {"finding_id": finding_id, "attempts_used": 0, "limit": limit}
+        record["rca_attempts"].append(counter)
+    elif counter["limit"] != limit:
+        raise RecordError("RCA counter limit differs from policy snapshot")
+    if counter["attempts_used"] >= counter["limit"]:
+        raise RecordError(f"RCA attempt limit reached for {finding_id}")
+    counter["attempts_used"] += 1
+    validate_run_record(record)
+    return counter
+
+
 def add_finding(
     record: dict[str, Any],
     task_id: str,
@@ -596,6 +711,7 @@ def add_finding(
     *,
     scope: str | None = None,
     blocking: bool = True,
+    evidence_ids: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Append a stable finding identity with an initial history entry."""
     now = _now()
@@ -606,15 +722,78 @@ def add_finding(
         "scope": scope or task_id,
         "blocking": blocking,
         "status": "open",
-        "evidence_ids": [],
+        "evidence_ids": list(evidence_ids),
         "history": [
-            {"at": now, "action": "opened", "rationale": summary, "evidence_ids": []}
+            {
+                "at": now,
+                "action": "opened",
+                "rationale": summary,
+                "evidence_ids": list(evidence_ids),
+            }
         ],
         "created_at": now,
     }
     record["findings"].append(finding)
     validate_run_record(record)
-    return finding
+    return cast(dict[str, Any], finding)
+
+
+def resolve_finding(
+    record: dict[str, Any],
+    finding_id: str,
+    rationale: str,
+    evidence_id: str,
+    *,
+    candidate_id: str,
+) -> dict[str, Any]:
+    """Resolve one open finding with an explicit passing evidence reference."""
+    finding = next(
+        (item for item in record["findings"] if item["id"] == finding_id), None
+    )
+    if finding is None:
+        raise RecordError(f"unknown finding {finding_id}")
+    if not finding["blocking"] or finding["status"] not in {"open", "deferred"}:
+        raise RecordError(f"finding {finding_id} is not unresolved")
+    if not rationale.strip():
+        raise RecordError("finding resolution rationale must not be empty")
+    evidence = next(
+        (item for item in record["evidence"] if item["id"] == evidence_id), None
+    )
+    assignment = (
+        next(
+            (
+                item
+                for item in record["assignments"]
+                if item["id"] == evidence.get("assignment_id")
+            ),
+            None,
+        )
+        if evidence is not None
+        else None
+    )
+    if (
+        evidence is None
+        or evidence["kind"] != "review"
+        or evidence["outcome"] != "pass"
+        or evidence["candidate_id"] != candidate_id
+        or assignment is None
+        or assignment["task_id"] != finding["task_id"]
+        or assignment["method"] != "Review"
+    ):
+        raise RecordError("finding resolution requires current passing review evidence")
+    now = _now()
+    finding["status"] = "resolved"
+    finding["evidence_ids"].append(evidence_id)
+    finding["history"].append(
+        {
+            "at": now,
+            "action": "resolved",
+            "rationale": rationale.strip(),
+            "evidence_ids": [evidence_id],
+        }
+    )
+    validate_run_record(record)
+    return cast(dict[str, Any], finding)
 
 
 def add_evidence(

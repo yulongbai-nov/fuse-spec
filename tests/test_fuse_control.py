@@ -21,6 +21,7 @@ import fuse_cli  # noqa: E402
 import fuse_config  # noqa: E402
 import fuse_control  # noqa: E402
 import fuse_launch  # noqa: E402
+import fuse_record  # noqa: E402
 import fuse_state  # noqa: E402
 
 
@@ -106,6 +107,99 @@ def initialized_run(root: Path, spec_dir: Path) -> str:
     result = run_cli(root, spec_dir, "initialize")
     assert result.returncode == 0, result.stderr
     return str(payload(result)["run_id"])
+
+
+def finish_assignment(
+    root: Path,
+    spec_dir: Path,
+    run_id: str,
+    task_id: str,
+    method: str,
+    role_profile: str,
+    host_handle: str,
+) -> dict[str, Any]:
+    prepared = run_cli(
+        root,
+        spec_dir,
+        "prepare-dispatch",
+        "--run-id",
+        run_id,
+        "--task-id",
+        task_id,
+        "--method",
+        method,
+        "--role-profile",
+        role_profile,
+    )
+    assert prepared.returncode == 0, prepared.stdout
+    assignment = payload(prepared)
+    bound = run_cli(
+        root,
+        spec_dir,
+        "bind-launch",
+        "--run-id",
+        run_id,
+        "--assignment-id",
+        assignment["assignment_id"],
+        "--attempt-id",
+        assignment["attempt_id"],
+        "--host-handle",
+        host_handle,
+    )
+    assert bound.returncode == 0, bound.stdout
+    completed = run_cli(
+        root,
+        spec_dir,
+        "record-result",
+        "--run-id",
+        run_id,
+        "--assignment-id",
+        assignment["assignment_id"],
+        "--attempt-id",
+        assignment["attempt_id"],
+        "--outcome",
+        "succeeded",
+        "--summary",
+        f"{method} completed",
+    )
+    assert completed.returncode == 0, completed.stdout
+    return assignment
+
+
+def fail_review_with_finding(
+    root: Path, spec_dir: Path, run_id: str, tmp_path: Path
+) -> tuple[str, str]:
+    finish_assignment(root, spec_dir, run_id, "T1", "Feature", "worker", "worker-1")
+    reviewer = finish_assignment(
+        root, spec_dir, run_id, "T1", "Review", "reviewer", "reviewer-1"
+    )
+    record = fuse_state.load_run(root, run_id)
+    candidate_id = record["assignments"][-1]["attempts"][-1]["result"]["candidate_id"]
+    report = tmp_path / "review-fail.md"
+    report.write_text("The implementation has a blocking defect.\n", encoding="utf-8")
+    failed = run_cli(
+        root,
+        spec_dir,
+        "record-review",
+        "--run-id",
+        run_id,
+        "--task-id",
+        "T1",
+        "--assignment-id",
+        reviewer["assignment_id"],
+        "--candidate-id",
+        candidate_id,
+        "--outcome",
+        "fail",
+        "--summary",
+        "A blocker prevents acceptance.",
+        "--finding",
+        "Correct the blocking behavior.",
+        "--report",
+        str(report),
+    )
+    assert failed.returncode == 0, failed.stdout
+    return candidate_id, str(payload(failed)["evidence_id"])
 
 
 def test_cli_requires_absolute_roots_and_returns_machine_reason(tmp_path: Path) -> None:
@@ -523,6 +617,8 @@ def test_acceptance_succeeds_with_current_check_and_independent_review(
         reviewer_id,
         "--candidate-id",
         candidate["candidate_id"],
+        "--outcome",
+        "pass",
         "--summary",
         "independent review passed",
         "--report",
@@ -552,15 +648,20 @@ def test_dispatch_enforces_shared_concurrency_limit(tmp_path: Path) -> None:
         tmp_path,
         "# Tasks\n\n"
         "- [ ] T1 First [id:T1 deps: impl:R1,D-Test]\n"
+        "    - **Files:** `src/one.py`\n"
         "- [ ] T2 Second [id:T2 deps: impl:R1,D-Test]\n"
+        "    - **Files:** `src/two.py`\n"
         "- [ ] T3 Third [id:T3 deps: impl:R1,D-Test]\n"
-        "- [ ] T4 Fourth [id:T4 deps: impl:R1,D-Test]\n",
+        "    - **Files:** `src/three.py`\n"
+        "- [ ] T4 Fourth [id:T4 deps: impl:R1,D-Test]\n"
+        "    - **Files:** `src/four.py`\n",
     )
     config_path = root / ".fuse" / "config.toml"
     config_path.write_text(
-        config_path.read_text(encoding="utf-8").replace(
-            "ordinary_luna_max_floor = 5", "ordinary_luna_max_floor = 2"
-        ),
+        config_path.read_text(encoding="utf-8")
+        .replace('model = "latest-luna"', 'model = "example-worker"')
+        .replace("ordinary_luna_max_floor = 5", "ordinary_luna_max_floor = 2")
+        .replace("other_profile_default = 3", "other_profile_default = 2"),
         encoding="utf-8",
     )
     git(root, "add", ".fuse/config.toml")
@@ -698,3 +799,484 @@ def test_launcher_passes_resolved_roots_to_uv_from_plugin_root(
         "--spec-dir",
         str((root / ".specs/001-demo").resolve()),
     ]
+
+
+def test_review_candidate_is_pinned_through_result_and_cannot_rebind(
+    tmp_path: Path,
+) -> None:
+    root, spec_dir = make_project(tmp_path)
+    run_id = initialized_run(root, spec_dir)
+    finish_assignment(root, spec_dir, run_id, "T1", "Feature", "worker", "worker-1")
+    reviewer = finish_assignment(
+        root, spec_dir, run_id, "T1", "Review", "reviewer", "reviewer-1"
+    )
+    record = fuse_state.load_run(root, run_id)
+    assignment = next(
+        item
+        for item in record["assignments"]
+        if item["id"] == reviewer["assignment_id"]
+    )
+    pinned_candidate = assignment["attempts"][-1]["result"]["candidate_id"]
+
+    (root / "app.py").write_text("value = 2\n", encoding="utf-8")
+    config = fuse_config.load_config(root / ".fuse" / "config.toml")
+    changed_candidate = fuse_control.current_candidate(record, root, spec_dir, config)
+    fuse_state.save_run(root, record)
+    assert changed_candidate["candidate_id"] != pinned_candidate
+    report = tmp_path / "review.md"
+    report.write_text("Review report\n", encoding="utf-8")
+
+    rebound = run_cli(
+        root,
+        spec_dir,
+        "record-review",
+        "--run-id",
+        run_id,
+        "--task-id",
+        "T1",
+        "--assignment-id",
+        reviewer["assignment_id"],
+        "--candidate-id",
+        changed_candidate["candidate_id"],
+        "--outcome",
+        "pass",
+        "--summary",
+        "Review completed",
+        "--report",
+        str(report),
+    )
+    assert rebound.returncode != 0
+    assert payload(rebound)["reason"] == "review_candidate_mismatch"
+
+    stale = run_cli(
+        root,
+        spec_dir,
+        "record-review",
+        "--run-id",
+        run_id,
+        "--task-id",
+        "T1",
+        "--assignment-id",
+        reviewer["assignment_id"],
+        "--candidate-id",
+        pinned_candidate,
+        "--outcome",
+        "pass",
+        "--summary",
+        "Review completed",
+        "--report",
+        str(report),
+    )
+    assert stale.returncode != 0
+    assert payload(stale)["reason"] == "candidate_stale"
+
+
+def test_failed_review_links_blocking_finding_and_allows_bug_fix_repair(
+    tmp_path: Path,
+) -> None:
+    root, spec_dir = make_project(tmp_path)
+    run_id = initialized_run(root, spec_dir)
+    candidate_id, failed_evidence_id = fail_review_with_finding(
+        root, spec_dir, run_id, tmp_path
+    )
+    record = fuse_state.load_run(root, run_id)
+    finding = record["findings"][0]
+    failed_evidence = next(
+        item for item in record["evidence"] if item["id"] == failed_evidence_id
+    )
+    assert failed_evidence["outcome"] == "fail"
+    assert failed_evidence["candidate_id"] == candidate_id
+    assert failed_evidence_id in finding["evidence_ids"]
+    assert failed_evidence_id in finding["history"][-1]["evidence_ids"]
+    assert record["tasks"]["T1"]["status"] == "in_progress"
+
+    repair = run_cli(
+        root,
+        spec_dir,
+        "prepare-dispatch",
+        "--run-id",
+        run_id,
+        "--task-id",
+        "T1",
+        "--method",
+        "Bug Fix",
+        "--role-profile",
+        "worker",
+    )
+    assert repair.returncode == 0, repair.stdout
+    counter = fuse_state.load_run(root, run_id)["review_counters"][0]
+    assert counter == {
+        "scope_id": "T1",
+        "level": "task",
+        "repairs_used": 1,
+        "limit": 2,
+    }
+
+
+def test_exhausted_repair_limit_still_allows_one_unspent_rca(
+    tmp_path: Path,
+) -> None:
+    root, spec_dir = make_project(tmp_path)
+    run_id = initialized_run(root, spec_dir)
+    record = fuse_state.load_run(root, run_id)
+    implementation = fuse_record.prepare_assignment(record, "T1", "Feature", "worker")
+    attempt = implementation["attempts"][0]
+    fuse_record.bind_launch(record, implementation["id"], attempt["id"], "impl-1")
+    fuse_record.record_attempt_result(
+        record,
+        implementation["id"],
+        attempt["id"],
+        "succeeded",
+        {"summary": "implementation complete"},
+    )
+    finding = fuse_record.add_finding(record, "T1", "Confirmed hard blocker")
+    record["review_counters"] = [
+        {"scope_id": "T1", "level": "task", "repairs_used": 2, "limit": 2}
+    ]
+    fuse_state.save_run(root, record)
+
+    ordinary_repair = run_cli(
+        root,
+        spec_dir,
+        "prepare-dispatch",
+        "--run-id",
+        run_id,
+        "--task-id",
+        "T1",
+        "--method",
+        "Bug Fix",
+        "--role-profile",
+        "worker",
+    )
+    assert ordinary_repair.returncode != 0
+    assert payload(ordinary_repair)["reason"] == "review_limit_exhausted"
+
+    missing_finding = run_cli(
+        root,
+        spec_dir,
+        "prepare-dispatch",
+        "--run-id",
+        run_id,
+        "--task-id",
+        "T1",
+        "--method",
+        "Bug Fix",
+        "--role-profile",
+        "rca",
+    )
+    assert missing_finding.returncode != 0
+    assert payload(missing_finding)["reason"] == "hard_blocker_required"
+
+    rca = run_cli(
+        root,
+        spec_dir,
+        "prepare-dispatch",
+        "--run-id",
+        run_id,
+        "--task-id",
+        "T1",
+        "--method",
+        "Bug Fix",
+        "--role-profile",
+        "rca",
+        "--finding-id",
+        finding["id"],
+    )
+    assert rca.returncode == 0, rca.stdout
+    rca_data = payload(rca)
+    assert rca_data["finding_id"] == finding["id"]
+    record = fuse_state.load_run(root, run_id)
+    assert record["rca_attempts"] == [
+        {"finding_id": finding["id"], "attempts_used": 1, "limit": 1}
+    ]
+
+    assert (
+        run_cli(
+            root,
+            spec_dir,
+            "bind-launch",
+            "--run-id",
+            run_id,
+            "--assignment-id",
+            rca_data["assignment_id"],
+            "--attempt-id",
+            rca_data["attempt_id"],
+            "--host-handle",
+            "rca-1",
+        ).returncode
+        == 0
+    )
+    assert (
+        run_cli(
+            root,
+            spec_dir,
+            "record-result",
+            "--run-id",
+            run_id,
+            "--assignment-id",
+            rca_data["assignment_id"],
+            "--attempt-id",
+            rca_data["attempt_id"],
+            "--outcome",
+            "succeeded",
+        ).returncode
+        == 0
+    )
+
+    exhausted_rca = run_cli(
+        root,
+        spec_dir,
+        "prepare-dispatch",
+        "--run-id",
+        run_id,
+        "--task-id",
+        "T1",
+        "--method",
+        "Bug Fix",
+        "--role-profile",
+        "rca",
+        "--finding-id",
+        finding["id"],
+    )
+    assert exhausted_rca.returncode != 0
+    assert payload(exhausted_rca)["reason"] == "rca_limit_exhausted"
+
+
+def test_passing_follow_up_resolves_only_explicit_findings_with_evidence(
+    tmp_path: Path,
+) -> None:
+    root, spec_dir = make_project(tmp_path)
+    run_id = initialized_run(root, spec_dir)
+    fail_review_with_finding(root, spec_dir, run_id, tmp_path)
+    finding_id = fuse_state.load_run(root, run_id)["findings"][0]["id"]
+    repair = run_cli(
+        root,
+        spec_dir,
+        "prepare-dispatch",
+        "--run-id",
+        run_id,
+        "--task-id",
+        "T1",
+        "--method",
+        "Bug Fix",
+        "--role-profile",
+        "worker",
+    )
+    repair_data = payload(repair)
+    assert repair.returncode == 0, repair.stdout
+    assert (
+        run_cli(
+            root,
+            spec_dir,
+            "bind-launch",
+            "--run-id",
+            run_id,
+            "--assignment-id",
+            repair_data["assignment_id"],
+            "--attempt-id",
+            repair_data["attempt_id"],
+            "--host-handle",
+            "repair-1",
+        ).returncode
+        == 0
+    )
+    assert (
+        run_cli(
+            root,
+            spec_dir,
+            "record-result",
+            "--run-id",
+            run_id,
+            "--assignment-id",
+            repair_data["assignment_id"],
+            "--attempt-id",
+            repair_data["attempt_id"],
+            "--outcome",
+            "succeeded",
+        ).returncode
+        == 0
+    )
+    reviewer = finish_assignment(
+        root, spec_dir, run_id, "T1", "Review", "reviewer", "reviewer-2"
+    )
+    report = tmp_path / "review-pass.md"
+    report.write_text("The repair resolves the blocker.\n", encoding="utf-8")
+    recorded = run_cli(
+        root,
+        spec_dir,
+        "record-review",
+        "--run-id",
+        run_id,
+        "--task-id",
+        "T1",
+        "--assignment-id",
+        reviewer["assignment_id"],
+        "--candidate-id",
+        reviewer["candidate_id"],
+        "--outcome",
+        "pass",
+        "--summary",
+        "The targeted blocker is fixed.",
+        "--resolve-finding-id",
+        finding_id,
+        "--resolution-rationale",
+        "The current candidate passes the regression check.",
+        "--report",
+        str(report),
+    )
+    assert recorded.returncode == 0, recorded.stdout
+    record = fuse_state.load_run(root, run_id)
+    finding = record["findings"][0]
+    evidence_id = payload(recorded)["evidence_id"]
+    assert finding["status"] == "resolved"
+    assert finding["history"][-1]["evidence_ids"] == [evidence_id]
+    assert evidence_id in finding["evidence_ids"]
+    assert record["evidence"][-1]["outcome"] == "pass"
+
+
+def test_review_artifact_symlink_cannot_escape_run_root(tmp_path: Path) -> None:
+    root, spec_dir = make_project(tmp_path)
+    run_id = initialized_run(root, spec_dir)
+    finish_assignment(root, spec_dir, run_id, "T1", "Feature", "worker", "worker-1")
+    reviewer = finish_assignment(
+        root, spec_dir, run_id, "T1", "Review", "reviewer", "reviewer-1"
+    )
+    record = fuse_state.load_run(root, run_id)
+    candidate_id = next(
+        attempt["result"]["candidate_id"]
+        for assignment in record["assignments"]
+        if assignment["id"] == reviewer["assignment_id"]
+        for attempt in assignment["attempts"]
+    )
+    review_dir = root / ".fuse" / "runs" / run_id / "artifacts" / "reviews"
+    review_dir.parent.mkdir(parents=True)
+    outside = tmp_path / "outside-reviews"
+    outside.mkdir()
+    review_dir.symlink_to(outside, target_is_directory=True)
+    report = tmp_path / "review.md"
+    report.write_text("Review report\n", encoding="utf-8")
+    result = run_cli(
+        root,
+        spec_dir,
+        "record-review",
+        "--run-id",
+        run_id,
+        "--task-id",
+        "T1",
+        "--assignment-id",
+        reviewer["assignment_id"],
+        "--candidate-id",
+        candidate_id,
+        "--outcome",
+        "pass",
+        "--summary",
+        "Review completed",
+        "--report",
+        str(report),
+    )
+    assert result.returncode != 0
+    assert payload(result)["reason"] == "artifact_path_escape"
+    assert list(outside.iterdir()) == []
+
+
+def test_luna_max_capacity_expands_to_independent_ready_task_count(
+    tmp_path: Path,
+) -> None:
+    tasks = "# Tasks\n\n" + "".join(
+        f"- [ ] T{index} Work {index} [id:T{index} deps: impl:R1,D-Test]\n"
+        f"    - **Files:** `src/work-{index}.py`\n"
+        for index in range(1, 8)
+    )
+    root, spec_dir = make_project(tmp_path, tasks)
+    config_path = root / ".fuse" / "config.toml"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            "ordinary_luna_max_floor = 5", "ordinary_luna_max_floor = 2"
+        ),
+        encoding="utf-8",
+    )
+    run_id = initialized_run(root, spec_dir)
+    dispatches = [
+        run_cli(
+            root,
+            spec_dir,
+            "prepare-dispatch",
+            "--run-id",
+            run_id,
+            "--task-id",
+            f"T{index}",
+            "--method",
+            "Feature",
+            "--role-profile",
+            "worker",
+        )
+        for index in range(1, 8)
+    ]
+    assert all(result.returncode == 0 for result in dispatches), [
+        result.stdout for result in dispatches
+    ]
+    assert payload(dispatches[-1])["capacity_limit"] == 7
+    record = fuse_state.load_run(root, run_id)
+    assert len({item["task_id"] for item in record["assignments"]}) == 7
+
+
+def test_approved_t7_t8_write_scopes_cannot_be_reserved_together(
+    tmp_path: Path,
+) -> None:
+    tasks = (
+        "# Tasks\n\n"
+        + "".join(
+            f"- [x] T{index} Prior accepted work [id:T{index} deps: impl:R1,D-Test]\n"
+            for index in range(1, 7)
+        )
+        + "- [ ] T7 Add serialized GitHub PR publication and exact "
+        + "merge-candidate gates "
+        + "[id:T7 deps:T3,T4,T5 impl:R3,D-PRIntegration,D-RunControl,D-Verification]\n"
+        + "    - **Files:** `skills/scripts/fuse_git.py`, `skills/scripts/fuse_pr.py`, "
+        + "`tests/test_pr_provider.py`\n"
+        + "- [ ] T8 Route `/reconcile-spec` and task checkbox updates through the "
+        + "shared "
+        + "record [id:T8 deps:T3,T5,T6 impl:R2,R3,R4,R5,D-RunControl,D-Coordinator]\n"
+        + "    - **Files:** `commands/reconcile-spec.md`, "
+        + "`skills/scripts/fuse_reconcile.py`, `tests/`\n"
+    )
+    root, spec_dir = make_project(tmp_path, tasks)
+    run_id = initialized_run(root, spec_dir)
+    record = fuse_state.load_run(root, run_id)
+    candidate_id = record["candidates"][0]["candidate_id"]
+    for index in range(1, 7):
+        record["tasks"][f"T{index}"] = {
+            "status": "accepted",
+            "assignment_ids": [],
+            "accepted_candidate_id": candidate_id,
+        }
+    fuse_state.save_run(root, record)
+    t7 = run_cli(
+        root,
+        spec_dir,
+        "prepare-dispatch",
+        "--run-id",
+        run_id,
+        "--task-id",
+        "T7",
+        "--method",
+        "Feature",
+        "--role-profile",
+        "worker",
+    )
+    assert t7.returncode == 0, t7.stdout
+    t8 = run_cli(
+        root,
+        spec_dir,
+        "prepare-dispatch",
+        "--run-id",
+        run_id,
+        "--task-id",
+        "T8",
+        "--method",
+        "Feature",
+        "--role-profile",
+        "worker",
+    )
+    assert t8.returncode != 0
+    assert payload(t8)["reason"] == "write_scope_conflict"

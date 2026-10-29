@@ -175,6 +175,55 @@ def _paths_from_files_line(value: str) -> list[str]:
     return paths
 
 
+def parse_task_declarations(
+    tasks_markdown: str,
+) -> tuple[dict[str, Task], set[str], set[str]]:
+    """Parse task metadata, write scopes, duplicate IDs, and checked task IDs."""
+    all_tasks: dict[str, Task] = {}
+    duplicates: set[str] = set()
+    done_ids: set[str] = set()
+    invalid: set[str] = set()
+    current_task_id: str | None = None
+    in_fence = False
+    for line in tasks_markdown.splitlines():
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        match = TASK_TAG.search(line)
+        if match:
+            task_id, dependencies, implementation = parse_tag(match.group(1))
+            current_task_id = task_id
+            if not task_id:
+                continue
+            if task_id in all_tasks:
+                duplicates.add(task_id)
+                continue
+            all_tasks[task_id] = {
+                "deps": dependencies,
+                "impl": implementation,
+                "writes": [],
+                "scope_invalid": False,
+            }
+            if DONE_RE.match(line):
+                done_ids.add(task_id)
+            continue
+        if current_task_id is None:
+            continue
+        indentation = len(line) - len(line.lstrip())
+        files_match = FILES_RE.match(line) if indentation >= 2 else None
+        if files_match:
+            task_scopes = _paths_from_files_line(files_match.group(1))
+            if not task_scopes:
+                all_tasks[current_task_id]["writes"] = []
+                all_tasks[current_task_id]["scope_invalid"] = True
+                invalid.add(current_task_id)
+            elif current_task_id not in invalid:
+                all_tasks[current_task_id]["writes"].extend(task_scopes)
+    return all_tasks, duplicates, done_ids
+
+
 def compute_waves(
     tasks: Mapping[str, Task], already_done: Collection[str] | None = None
 ) -> list[list[str]]:
@@ -246,49 +295,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: not a file: {path}", file=sys.stderr)
         return 2
 
-    all_tasks: dict[str, Task] = {}
-    duplicates: set[str] = set()
-    done_ids: set[str] = set()
-    current_task_id: str | None = None
-    in_fence = False
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if line.lstrip().startswith("```"):
-            in_fence = not in_fence
-            continue
-        if in_fence:
-            continue
-
-        match = TASK_TAG.search(line)
-        if match:
-            task_id, deps, impl = parse_tag(match.group(1))
-            current_task_id = task_id
-            if not task_id:
-                continue
-            if task_id in all_tasks:
-                duplicates.add(task_id)
-                continue
-            all_tasks[task_id] = {
-                "deps": deps,
-                "impl": impl,
-                "writes": [],
-                "scope_invalid": False,
-            }
-            if DONE_RE.match(line):
-                done_ids.add(task_id)
-            continue
-
-        if current_task_id is None:
-            continue
-        indentation = len(line) - len(line.lstrip())
-        files_match = FILES_RE.match(line) if indentation >= 2 else None
-        if files_match:
-            task = all_tasks[current_task_id]
-            scope_paths = _paths_from_files_line(files_match.group(1))
-            if not scope_paths:
-                task["writes"] = []
-                task["scope_invalid"] = True
-            elif not task["scope_invalid"]:
-                task["writes"].extend(scope_paths)
+    all_tasks, duplicates, done_ids = parse_task_declarations(
+        path.read_text(encoding="utf-8")
+    )
 
     if duplicates:
         for task_id in sorted(duplicates):

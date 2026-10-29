@@ -93,6 +93,7 @@ def _parser() -> argparse.ArgumentParser:
     prepare.add_argument("--task-id", required=True)
     prepare.add_argument("--method", required=True)
     prepare.add_argument("--role-profile", required=True)
+    prepare.add_argument("--finding-id")
 
     bind = commands.add_parser("bind-launch", help="bind a returned host handle")
     _add_paths(bind)
@@ -130,7 +131,11 @@ def _parser() -> argparse.ArgumentParser:
     review.add_argument("--task-id", required=True)
     review.add_argument("--assignment-id", required=True)
     review.add_argument("--candidate-id", required=True)
+    review.add_argument("--outcome", choices=("pass", "fail"), required=True)
     review.add_argument("--summary", required=True)
+    review.add_argument("--finding", action="append", default=[])
+    review.add_argument("--resolve-finding-id", action="append", default=[])
+    review.add_argument("--resolution-rationale")
     review.add_argument("--report", required=True, type=Path)
 
     accept = commands.add_parser("accept", help="accept a task with current evidence")
@@ -433,6 +438,7 @@ def _prepare(
             task_id=args.task_id,
             method=args.method,
             role_profile=args.role_profile,
+            finding_id=args.finding_id,
         )
     except fuse_control.ControlError as error:
         if error.reason in {
@@ -443,13 +449,41 @@ def _prepare(
             _save(root, record)
             error.details["record_path"] = _record_path(root, record)
         raise
+    review_candidate_id: str | None = None
+    if args.role_profile in fuse_control.REVIEW_ROLES:
+        candidate = fuse_control.current_candidate(record, root, spec, config)
+        if candidate["candidate_id"] != decision.details["candidate_id"]:
+            raise fuse_control.ControlError(
+                "candidate_changed_during_dispatch",
+                "review candidate changed while reserving the assignment",
+            )
+        review_candidate_id = candidate["candidate_id"]
     assignment = fuse_record.prepare_assignment(
         record,
         args.task_id,
         args.method,
         args.role_profile,
         capacity=int(decision.details["reserved_capacity"]),
+        review_candidate_id=review_candidate_id,
+        finding_id=args.finding_id,
     )
+    repair_kind = decision.details.get("repair_kind")
+    if repair_kind == "task":
+        fuse_record.reserve_task_repair(
+            record,
+            args.task_id,
+            int(config["limits"]["review"]["max_repair_rounds_per_level"]),
+        )
+    elif repair_kind == "rca":
+        if args.finding_id is None:
+            raise fuse_control.ControlError(
+                "hard_blocker_required", "RCA dispatch requires --finding-id"
+            )
+        fuse_record.reserve_rca_attempt(
+            record,
+            args.finding_id,
+            int(config["limits"]["rca"]["attempts_per_hard_blocker"]),
+        )
     _save(root, record)
     _success(
         "prepare-dispatch",
@@ -458,6 +492,7 @@ def _prepare(
         assignment_id=assignment["id"],
         attempt_id=assignment["attempts"][-1]["id"],
         candidate_id=decision.details["candidate_id"] or None,
+        finding_id=args.finding_id,
         reserved_capacity=fuse_record.reserved_capacity(record),
         capacity_limit=decision.details["capacity_limit"],
         record_path=_record_path(root, record),
@@ -505,6 +540,7 @@ def _record_result(
         assignment_id=args.assignment_id,
         attempt_id=args.attempt_id,
         outcome=args.outcome,
+        candidate_id=args.candidate_id,
     )
     result_data: dict[str, Any] = {"summary": args.summary}
     if args.candidate_id:
@@ -563,13 +599,6 @@ def _record_review(
     root: Path, spec: Path, config: Mapping[str, Any], args: argparse.Namespace
 ) -> None:
     record = _load_run(root, spec, args.run_id)
-    candidate = fuse_control.current_candidate(record, root, spec, config)
-    if candidate["candidate_id"] != args.candidate_id:
-        raise fuse_control.ControlError(
-            "candidate_stale",
-            "review report must match the current candidate",
-            {"current_candidate_id": candidate["candidate_id"]},
-        )
     report_path = args.report if args.report.is_absolute() else root / args.report
     report_path = report_path.expanduser().resolve(strict=True)
     report = report_path.read_bytes()
@@ -581,8 +610,12 @@ def _record_review(
         args.task_id,
         args.assignment_id,
         args.candidate_id,
+        args.outcome,
         args.summary,
         report,
+        finding_summaries=args.finding,
+        resolve_finding_ids=args.resolve_finding_id,
+        resolution_rationale=args.resolution_rationale,
     )
     _save(root, record)
     _success(
@@ -591,6 +624,7 @@ def _record_review(
         task_id=args.task_id,
         evidence_id=evidence["id"],
         candidate_id=args.candidate_id,
+        outcome=args.outcome,
         artifact=evidence["artifacts"][0]["path"],
         record_path=_record_path(root, record),
     )

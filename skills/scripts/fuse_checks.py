@@ -18,6 +18,7 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 if TYPE_CHECKING:
+    from fuse_artifacts import ArtifactError, write_run_artifact
     from fuse_candidate import (
         build_candidate_manifest,
         normalize_task_checkboxes,
@@ -33,6 +34,7 @@ if TYPE_CHECKING:
     from fuse_record import add_evidence, evidence_available, validate_run_record
 else:
     try:
+        from .fuse_artifacts import ArtifactError, write_run_artifact
         from .fuse_candidate import (
             build_candidate_manifest,
             normalize_task_checkboxes,
@@ -47,6 +49,7 @@ else:
         )
         from .fuse_record import add_evidence, evidence_available, validate_run_record
     except ImportError:
+        from fuse_artifacts import ArtifactError, write_run_artifact
         from fuse_candidate import (
             build_candidate_manifest,
             normalize_task_checkboxes,
@@ -569,43 +572,10 @@ def _write_output_artifact(
     relative = (
         Path("artifacts") / "checks" / candidate_id / check_id / f"{execution_id}.log"
     )
-    run_root = (root / ".fuse" / "runs" / run_id).resolve(strict=False)
     try:
-        run_root.relative_to(root)
-    except ValueError as error:
-        raise CheckError(
-            "run artifact directory resolves outside the repository"
-        ) from error
-    destination = run_root / relative
-    try:
-        destination.resolve(strict=False).relative_to(run_root)
-    except (OSError, RuntimeError, ValueError) as error:
-        raise CheckError(
-            "artifact destination resolves outside the run directory"
-        ) from error
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        destination.resolve(strict=False).relative_to(run_root)
-    except (OSError, RuntimeError, ValueError) as error:
-        raise CheckError(
-            "artifact destination resolves outside the run directory"
-        ) from error
-    created = False
-    try:
-        with destination.open("xb") as stream:
-            created = True
-            stream.write(content)
-            stream.flush()
-            os.fsync(stream.fileno())
-    except OSError:
-        if created:
-            destination.unlink(missing_ok=True)
-        raise
-    return {
-        "path": relative.as_posix(),
-        "sha256": hashlib.sha256(content).hexdigest(),
-        "required": True,
-    }
+        return write_run_artifact(root, run_id, relative, content)
+    except ArtifactError as error:
+        raise CheckError(f"check output artifact {error}") from error
 
 
 def _record_result(

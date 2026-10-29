@@ -4,28 +4,37 @@
 from __future__ import annotations
 
 import copy
-import hashlib
-from collections.abc import Mapping
+import uuid
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
+    import fuse_artifacts
     import fuse_candidate
     import fuse_checks
     import fuse_graph
     import fuse_record
-    import fuse_state
+    import plan_waves
 else:
     try:
-        from . import fuse_candidate, fuse_checks, fuse_graph, fuse_record, fuse_state
+        from . import (
+            fuse_artifacts,
+            fuse_candidate,
+            fuse_checks,
+            fuse_graph,
+            fuse_record,
+            plan_waves,
+        )
     except ImportError:
+        import fuse_artifacts
         import fuse_candidate
         import fuse_checks
         import fuse_graph
         import fuse_record
-        import fuse_state
+        import plan_waves
 
 IMPLEMENTATION_METHODS = {
     "Bug Fix",
@@ -225,6 +234,88 @@ def current_candidate(
         )
     except (fuse_candidate.CandidateError, fuse_record.RecordError) as error:
         raise ControlError("candidate_invalid", str(error)) from error
+
+
+def _task_write_scopes(spec_dir: Path) -> dict[str, list[str]]:
+    try:
+        tasks_text = (spec_dir / "tasks.md").read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise ControlError(
+            "approved_spec_incomplete", f"cannot read tasks.md: {error}"
+        ) from error
+    parsed, _duplicates, _done = plan_waves.parse_task_declarations(tasks_text)
+    return {task_id: task["writes"] for task_id, task in parsed.items()}
+
+
+def _scope_conflicts(
+    record: Mapping[str, Any],
+    task_id: str,
+    scopes: Mapping[str, list[str]],
+) -> list[str]:
+    active_writer_ids = sorted(
+        {
+            str(assignment["task_id"])
+            for assignment in record["assignments"]
+            if assignment["reservation_active"]
+            and assignment["role_profile"] not in REVIEW_ROLES
+        }
+    )
+    requested = scopes.get(task_id, [])
+    conflicts: list[str] = []
+    for active_task_id in active_writer_ids:
+        existing = scopes.get(active_task_id, [])
+        if (
+            not requested
+            or not existing
+            or any(
+                plan_waves.scopes_overlap(first, second)
+                for first in requested
+                for second in existing
+            )
+        ):
+            conflicts.append(active_task_id)
+    return conflicts
+
+
+def _independent_worker_task_count(
+    record: Mapping[str, Any],
+    graph: Mapping[str, list[str]],
+    scopes: Mapping[str, list[str]],
+    requested_task_id: str,
+) -> int:
+    eligible = set(fuse_graph.ready_task_ids(graph, record))
+    eligible.add(requested_task_id)
+    eligible.update(
+        str(assignment["task_id"])
+        for assignment in record["assignments"]
+        if assignment["reservation_active"]
+        and assignment["role_profile"] not in REVIEW_ROLES
+    )
+    if any(not scopes.get(task_id, []) for task_id in eligible):
+        return 1
+    selected_scopes: list[str] = []
+    count = 0
+    for task_id in sorted(eligible):
+        task_scopes = scopes.get(task_id, [])
+        if any(
+            plan_waves.scopes_overlap(scope, existing)
+            for scope in task_scopes
+            for existing in selected_scopes
+        ):
+            continue
+        selected_scopes.extend(task_scopes)
+        count += 1
+    return count
+
+
+def _dependencies_accepted(
+    record: Mapping[str, Any], graph: Mapping[str, list[str]], task_id: str
+) -> bool:
+    for dependency in graph[task_id]:
+        state = record["tasks"].get(dependency, {})
+        if state.get("status") != "accepted" or not state.get("accepted_candidate_id"):
+            return False
+    return True
 
 
 def _snapshot(
@@ -433,7 +524,11 @@ def _acceptance(
             for item in record["review_counters"]
             if item["scope_id"] == task_id and item["level"] == "task"
         ]
-        if counters and counters[-1]["repairs_used"] >= counters[-1]["limit"]:
+        policy_limits = record["effective_policy_snapshot"].get("limits", {})
+        review_policy = policy_limits.get("review", {})
+        repair_limit = int(review_policy.get("max_repair_rounds_per_level", 0))
+        repairs_used = counters[-1]["repairs_used"] if counters else 0
+        if repairs_used >= repair_limit:
             return _deny(
                 "review_limit_exhausted",
                 "task repair limit reached",
@@ -469,6 +564,11 @@ def validate_transition(
     outcome: str | None = None,
     host_handle: str | None = None,
     candidate_id: str | None = None,
+    finding_id: str | None = None,
+    review_outcome: str | None = None,
+    finding_summaries: Sequence[str] = (),
+    resolve_finding_ids: Sequence[str] = (),
+    resolution_rationale: str | None = None,
     check_id: str | None = None,
 ) -> TransitionDecision:
     """Validate every managed state transition for CLI and reconcile callers."""
@@ -524,6 +624,9 @@ def validate_transition(
             )
         if method not in IMPLEMENTATION_METHODS | {"Review"}:
             return _deny("unknown_method", f"method {method!r} is not supported")
+        role = cast(Mapping[str, Any], roles[role_profile])
+        is_reviewer = role_profile in REVIEW_ROLES
+        is_rca = role_profile == "rca"
         budget = _execution_budget_gate(current)
         if budget is not None:
             return budget
@@ -535,11 +638,23 @@ def validate_transition(
                 "assignment_unresolved",
                 f"task {task_id} already has an unresolved assignment",
             )
-        candidate_id_for_dispatch = ""
-        if role_profile in REVIEW_ROLES:
+        candidate_id_for_dispatch: str | None = None
+        repair_kind: str | None = None
+        task_findings = [
+            finding
+            for finding in current["findings"]
+            if finding["task_id"] == task_id
+            and finding["blocking"]
+            and finding["status"] in {"open", "deferred"}
+        ]
+        if is_reviewer:
             if method != "Review":
                 return _deny(
                     "review_method_required", "review assignments must use Review"
+                )
+            if finding_id is not None:
+                return _deny(
+                    "finding_not_allowed", "review assignments do not take --finding-id"
                 )
             if _implementation(current, task_id) is None:
                 return _deny(
@@ -559,21 +674,118 @@ def validate_transition(
                 return _deny(
                     "review_role_required", "Review requires a reviewer role profile"
                 )
-            eligible = fuse_graph.ready_task_ids(graph, current)
-            if task_id not in eligible:
+            if finding_id is not None and not any(
+                finding["id"] == finding_id for finding in task_findings
+            ):
                 return _deny(
-                    "task_not_ready",
-                    f"task {task_id} is not ready from approved dependencies and "
-                    "accepted run state",
-                    eligible_task_ids=eligible,
+                    "hard_blocker_invalid",
+                    "finding must be an open blocking finding for this task",
+                    finding_id=finding_id,
                 )
-        role = cast(Mapping[str, Any], roles[role_profile])
+            implementation_exists = _implementation(current, task_id) is not None
+            if is_rca:
+                if method != "Bug Fix":
+                    return _deny(
+                        "rca_bug_fix_required", "RCA assignments must use Bug Fix"
+                    )
+                if finding_id is None:
+                    return _deny(
+                        "hard_blocker_required", "RCA dispatch requires --finding-id"
+                    )
+                if not implementation_exists or not _dependencies_accepted(
+                    current, graph, task_id
+                ):
+                    return _deny(
+                        "task_not_ready",
+                        "RCA repair requires an existing implementation and "
+                        "accepted dependencies",
+                    )
+                rca_counters = [
+                    item
+                    for item in current["rca_attempts"]
+                    if item["finding_id"] == finding_id
+                ]
+                rca_policy = current["effective_policy_snapshot"]["limits"]["rca"]
+                rca_limit = int(rca_policy["attempts_per_hard_blocker"])
+                attempts_used = rca_counters[-1]["attempts_used"] if rca_counters else 0
+                if attempts_used >= rca_limit:
+                    return _deny(
+                        "rca_limit_exhausted",
+                        "RCA attempt limit reached for this finding",
+                        finding_id=finding_id,
+                        attempts_used=attempts_used,
+                        limit=rca_limit,
+                    )
+                repair_kind = "rca"
+            elif task_findings and implementation_exists:
+                if method != "Bug Fix":
+                    return _deny(
+                        "repair_method_required",
+                        "a task with blocking review findings requires a "
+                        "Bug Fix repair",
+                        finding_ids=[finding["id"] for finding in task_findings],
+                    )
+                if not _dependencies_accepted(current, graph, task_id):
+                    return _deny(
+                        "task_not_ready",
+                        "repair dependencies must remain accepted",
+                    )
+                repair_counters = [
+                    item
+                    for item in current["review_counters"]
+                    if item["scope_id"] == task_id and item["level"] == "task"
+                ]
+                review_policy = current["effective_policy_snapshot"]["limits"]["review"]
+                repair_limit = int(review_policy["max_repair_rounds_per_level"])
+                repairs_used = (
+                    repair_counters[-1]["repairs_used"] if repair_counters else 0
+                )
+                if repairs_used >= repair_limit:
+                    return _deny(
+                        "review_limit_exhausted",
+                        "task repair limit reached",
+                        finding_ids=[finding["id"] for finding in task_findings],
+                        repairs_used=repairs_used,
+                        limit=repair_limit,
+                    )
+                repair_kind = "task"
+            else:
+                eligible = fuse_graph.ready_task_ids(graph, current)
+                if task_id not in eligible:
+                    return _deny(
+                        "task_not_ready",
+                        f"task {task_id} is not ready from approved dependencies and "
+                        "accepted run state",
+                        eligible_task_ids=eligible,
+                    )
+        scope_conflicts: list[str] = []
+        scopes: dict[str, list[str]] = {}
+        if not is_reviewer:
+            try:
+                scopes = _task_write_scopes(spec)
+            except ControlError as error:
+                return _deny(error.reason, str(error), **error.details)
+            scope_conflicts = _scope_conflicts(current, task_id, scopes)
+            if scope_conflicts:
+                return _deny(
+                    "write_scope_conflict",
+                    "another reserved worker has an overlapping or unknown write scope",
+                    conflicting_task_ids=scope_conflicts,
+                )
         concurrency = config["limits"]["concurrency"]
-        cap = int(
-            concurrency["ordinary_luna_max_floor"]
-            if role["model"] == "latest-luna" and role["reasoning_effort"] == "max"
-            else concurrency["other_profile_default"]
+        is_ordinary_luna_max = (
+            role_profile == "worker"
+            and role["model"] == "latest-luna"
+            and role["reasoning_effort"] == "max"
         )
+        eligible_count: int | None = None
+        if is_ordinary_luna_max:
+            eligible_count = _independent_worker_task_count(
+                current, graph, scopes, task_id
+            )
+            cap = max(int(concurrency["ordinary_luna_max_floor"]), eligible_count)
+        else:
+            cap = int(concurrency["other_profile_default"])
         reserved = fuse_record.reserved_capacity(current)
         if reserved + 1 > cap:
             return _deny(
@@ -589,6 +801,9 @@ def validate_transition(
             reserved_capacity=1,
             capacity_limit=cap,
             candidate_id=candidate_id_for_dispatch,
+            finding_id=finding_id,
+            repair_kind=repair_kind,
+            eligible_independent_task_workers=eligible_count,
         )
 
     if operation in {"bind-launch", "record-result"}:
@@ -640,8 +855,27 @@ def validate_transition(
                 assignment_id=assignment_id,
                 attempt_id=attempt_id,
             )
+        dispatch_result = selected_attempt.get("result", {})
+        pinned_candidate = (
+            dispatch_result.get("candidate_id")
+            if isinstance(dispatch_result, Mapping)
+            else None
+        )
+        if (
+            pinned_candidate is not None
+            and candidate_id is not None
+            and candidate_id != pinned_candidate
+        ):
+            return _deny(
+                "review_candidate_mismatch",
+                "review result cannot change the candidate pinned at dispatch",
+                pinned_candidate_id=pinned_candidate,
+            )
         return _allow(
-            assignment_id=assignment_id, attempt_id=attempt_id, outcome=outcome
+            assignment_id=assignment_id,
+            attempt_id=attempt_id,
+            outcome=outcome,
+            candidate_id=pinned_candidate,
         )
 
     if operation == "run-check":
@@ -689,6 +923,23 @@ def validate_transition(
                 "reviewer_not_independent",
                 "reviewer must differ from the implementation assignment",
             )
+        reviewer_result = _latest(reviewer).get("result", {})
+        pinned_candidate_id = (
+            reviewer_result.get("candidate_id")
+            if isinstance(reviewer_result, Mapping)
+            else None
+        )
+        if not isinstance(pinned_candidate_id, str):
+            return _deny(
+                "review_candidate_unpinned",
+                "review assignment has no candidate pinned at dispatch",
+            )
+        if candidate_id != pinned_candidate_id:
+            return _deny(
+                "review_candidate_mismatch",
+                "review report must match the candidate pinned at dispatch",
+                pinned_candidate_id=pinned_candidate_id,
+            )
         try:
             current_id = str(
                 _candidate(current, root, _manifest(current, root, spec, config))[
@@ -703,8 +954,73 @@ def validate_transition(
                 "review report must match the current candidate",
                 current_candidate_id=current_id,
             )
+        if review_outcome not in {"pass", "fail"}:
+            return _deny(
+                "review_outcome_required", "review outcome must be pass or fail"
+            )
+        normalized_findings = [summary.strip() for summary in finding_summaries]
+        if any(not summary for summary in normalized_findings):
+            return _deny(
+                "review_finding_invalid", "review finding summaries must not be empty"
+            )
+        if review_outcome == "fail" and not normalized_findings:
+            return _deny(
+                "review_findings_required",
+                "a failed review must record at least one finding",
+            )
+        if review_outcome == "pass" and normalized_findings:
+            return _deny(
+                "passing_review_findings_invalid",
+                "passing reviews cannot add findings; use a failed review",
+            )
+        if len(resolve_finding_ids) != len(set(resolve_finding_ids)):
+            return _deny(
+                "duplicate_finding_resolution",
+                "a finding may be named for resolution only once",
+            )
+        if review_outcome == "fail" and resolve_finding_ids:
+            return _deny(
+                "failed_review_cannot_resolve",
+                "failed review evidence cannot resolve findings",
+            )
+        if resolve_finding_ids and not (
+            isinstance(resolution_rationale, str) and resolution_rationale.strip()
+        ):
+            return _deny(
+                "resolution_rationale_required",
+                "explicit finding resolutions require a rationale",
+            )
+        if not resolve_finding_ids and resolution_rationale:
+            return _deny(
+                "resolution_target_required",
+                "resolution rationale requires at least one finding ID",
+            )
+        for resolved_id in resolve_finding_ids:
+            finding = next(
+                (item for item in current["findings"] if item["id"] == resolved_id),
+                None,
+            )
+            if (
+                finding is None
+                or finding["task_id"] != task_id
+                or not finding["blocking"]
+                or finding["status"] not in {"open", "deferred"}
+            ):
+                return _deny(
+                    "finding_resolution_invalid",
+                    "only an unresolved blocking finding for this task can be resolved",
+                    finding_id=resolved_id,
+                )
         return _allow(
-            task_id=task_id, assignment_id=assignment_id, candidate_id=current_id
+            task_id=task_id,
+            assignment_id=assignment_id,
+            candidate_id=current_id,
+            outcome=review_outcome,
+            finding_summaries=normalized_findings,
+            resolve_finding_ids=list(resolve_finding_ids),
+            resolution_rationale=(
+                resolution_rationale.strip() if resolution_rationale else None
+            ),
         )
 
     if operation == "accept":
@@ -763,8 +1079,13 @@ def record_review_evidence(
     task_id: str,
     assignment_id: str,
     candidate_id: str,
+    outcome: str,
     summary: str,
     report: bytes,
+    *,
+    finding_summaries: Sequence[str] = (),
+    resolve_finding_ids: Sequence[str] = (),
+    resolution_rationale: str | None = None,
 ) -> dict[str, Any]:
     """Store reviewer output as a required artifact and append its evidence ID."""
     if not summary.strip() or not report:
@@ -780,6 +1101,10 @@ def record_review_evidence(
         task_id=task_id,
         assignment_id=assignment_id,
         candidate_id=candidate_id,
+        review_outcome=outcome,
+        finding_summaries=finding_summaries,
+        resolve_finding_ids=resolve_finding_ids,
+        resolution_rationale=resolution_rationale,
     )
     if not decision.allowed:
         raise ControlError(decision.reason, decision.message, decision.details)
@@ -787,32 +1112,46 @@ def record_review_evidence(
         item for item in record["candidates"] if item["candidate_id"] == candidate_id
     )
     try:
-        artifact_root = fuse_state.run_record_path(
-            repository_root, record["run_id"]
-        ).parent
-    except fuse_state.StateError as error:
-        raise ControlError("run_path_invalid", str(error)) from error
-    digest = hashlib.sha256(report).hexdigest()
-    relative = f"artifacts/reviews/{task_id}-{assignment_id}-{digest}.md"
-    path = artifact_root / relative
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists() and path.read_bytes() != report:
-        raise ControlError(
-            "review_artifact_collision", "review artifact content differs"
+        artifact = fuse_artifacts.write_run_artifact(
+            repository_root,
+            record["run_id"],
+            Path("artifacts")
+            / "reviews"
+            / f"{task_id}-{assignment_id}-{uuid.uuid4().hex}.md",
+            report,
         )
-    path.write_bytes(report)
+    except fuse_artifacts.ArtifactError as error:
+        raise ControlError(error.reason, str(error)) from error
     try:
-        return fuse_record.add_evidence(
+        evidence = fuse_record.add_evidence(
             record,
             candidate_id,
             "review",
-            "pass",
+            outcome,
             summary.strip(),
             assignment_id=assignment_id,
-            artifacts=[{"path": relative, "sha256": digest, "required": True}],
+            artifacts=[artifact],
             source_provenance=candidate["source_provenance"],
             tool_versions={},
         )
+        if outcome == "fail":
+            for finding_summary in decision.details["finding_summaries"]:
+                fuse_record.add_finding(
+                    record,
+                    task_id,
+                    finding_summary,
+                    evidence_ids=[evidence["id"]],
+                )
+        else:
+            for finding_id in decision.details["resolve_finding_ids"]:
+                fuse_record.resolve_finding(
+                    record,
+                    finding_id,
+                    str(decision.details["resolution_rationale"]),
+                    evidence["id"],
+                    candidate_id=candidate_id,
+                )
+        return evidence
     except fuse_record.RecordError as error:
         raise ControlError("run_record_invalid", str(error)) from error
 
