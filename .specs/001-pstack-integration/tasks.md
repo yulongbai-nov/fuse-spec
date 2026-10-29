@@ -24,7 +24,8 @@
     - Record the selected runtime, package manager, manifest, lockfile, and tool-restoration policy. Initialization validates that the selected files exist and are compatible, reuses an existing configuration, and fails closed without changing consumer package files when the default or supplied pre-assessed template does not match. It does not install tools.
 
 - [ ] T3 Add the versioned run record and single-writer state backend  [id:T3 deps:T1,T2 impl:R2,R3,R5,D-RunControl]
-    - **Files:** `schemas/run-record.schema.json`, `skills/scripts/fuse_record.py`, `skills/scripts/fuse_state.py`, `tests/`
+    - **Files:** `.gitignore`, `schemas/run-record.schema.json`, `skills/scripts/fuse_record.py`, `skills/scripts/fuse_state.py`, `tests/`
+    - Ignore the local `.fuse/runs/` replica in ordinary code branches; the state backend force-includes it only in the per-run state ref.
     - Test record schema/version validation, stable assignment/finding/evidence IDs, append-only retry history, immutable effective-policy snapshots, and refusal to silently migrate an unknown schema version.
     - Implement the one `run.json` contract and per-run remote state ref defined in `design.md`. Use fast-forward-only updates, fetch/reconcile on a competing update, and never force-push or create a second authoritative copy.
     - Persist a dispatch assignment and reserve capacity before host launch; bind the returned host handle afterward. On resume, unresolved launches remain reserved until reconciled and cannot be relaunched as duplicates.
@@ -75,4 +76,3 @@
     - Configure CI to invoke the same project-owned check entry point and definitions as local Fuse execution. Keep only provisioning, credentials, triggers, caching, and artifact transport specific to the workflow environment.
     - Document setup, supported Python version, configuration, command usage, state-ref recovery, Codex capability limits, routes, evidence gates, and clear unverified/blocked outcomes. Keep full transcripts and unrelated work outside the run record.
     - Run traceability, dependency planning, all project checks, and the task-, integrated-PR-, and whole-codebase review levels. Resolve findings within their configured maximum of two rounds per level before merge.
-
