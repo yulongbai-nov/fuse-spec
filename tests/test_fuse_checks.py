@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from _support import git, make_minimal_spec_repository
 
 SCRIPT_DIR = Path(__file__).parents[1] / "skills" / "scripts"
 sys.path.insert(0, str(SCRIPT_DIR))
@@ -22,30 +23,9 @@ fuse_checks: Any = importlib.import_module("fuse_checks")
 fuse_record: Any = importlib.import_module("fuse_record")
 
 
-def git(root: Path, *args: str) -> str:
-    result = subprocess.run(
-        ["git", "-C", str(root), *args],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return result.stdout.strip()
-
-
 def check_project(tmp_path: Path) -> tuple[Path, Path, dict[str, Any], dict[str, Any]]:
-    root = tmp_path / "repo"
-    spec_dir = root / ".specs" / "001-demo"
-    spec_dir.mkdir(parents=True)
-    git(root, "init", "--initial-branch=main")
-    git(root, "config", "user.name", "Fuse Test")
-    git(root, "config", "user.email", "fuse@example.invalid")
-    (root / "src").mkdir()
-    (root / "src" / "app.py").write_text("value = 1\n", encoding="utf-8")
-    (spec_dir / "requirements.md").write_text("### R1 Requirement\n", encoding="utf-8")
-    (spec_dir / "design.md").write_text("### D-Core\nsatisfies: R1\n", encoding="utf-8")
-    (spec_dir / "tasks.md").write_text(
-        "- [ ] T1 Implement [id:T1 deps: impl:R1,D-Core]\n",
-        encoding="utf-8",
+    root, spec_dir = make_minimal_spec_repository(
+        tmp_path, include_fixture=False, commit_message="initial check candidate"
     )
     template = tomllib.loads(
         (Path(__file__).parents[1] / ".fuse" / "config.toml").read_text(
@@ -74,8 +54,6 @@ def check_project(tmp_path: Path) -> tuple[Path, Path, dict[str, Any], dict[str,
         },
     }
     effective_policy = {"roles": {"worker": {"model": "example-model"}}}
-    git(root, "add", "-A")
-    git(root, "commit", "-m", "initial check candidate")
     return root, spec_dir, config, effective_policy
 
 
@@ -143,8 +121,8 @@ def append_check_evidence(
             artifacts=artifacts,
             source_provenance=source,
             tool_versions={"python": "3.11"},
-            config_digest=fuse_checks._canonical_digest(config),
-            check_definition_digest=fuse_checks._canonical_digest(
+            config_digest=fuse_record.canonical_json_digest(config),
+            check_definition_digest=fuse_record.canonical_json_digest(
                 config["checks"][check_id]
             ),
         ),

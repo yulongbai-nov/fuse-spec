@@ -38,7 +38,8 @@ def _default_schema_path() -> Path:
     return _plugin_root() / "schemas" / "run-record.schema.json"
 
 
-def _now() -> str:
+def utc_timestamp() -> str:
+    """Return the established UTC ISO-8601 timestamp representation."""
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
@@ -46,15 +47,20 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
 
 
-def _candidate_digest(manifest: Mapping[str, Any]) -> str:
+def canonical_json_digest(value: Any) -> str:
+    """Hash the canonical JSON representation shared by records and checks."""
     payload = json.dumps(
-        manifest,
+        value,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
         allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _candidate_digest(manifest: Mapping[str, Any]) -> str:
+    return canonical_json_digest(manifest)
 
 
 def _schema_errors(schema_path: Path | None) -> Draft202012Validator:
@@ -454,7 +460,7 @@ def new_run_record(
     spec_digests: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Create a new run snapshot without mutating the supplied effective policy."""
-    now = _now()
+    now = utc_timestamp()
     record: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "spec_id": spec_id,
@@ -506,7 +512,7 @@ def add_candidate(
         "candidate_id": candidate_id,
         "manifest": manifest_copy,
         "source_provenance": provenance_copy,
-        "created_at": _now(),
+        "created_at": utc_timestamp(),
     }
     record["candidates"].append(candidate)
     validate_run_record(record)
@@ -532,7 +538,7 @@ def prepare_assignment(
         for item in record["assignments"]
     ):
         raise RecordError(f"task {task_id} already has an unresolved assignment")
-    now = _now()
+    now = utc_timestamp()
     assignment_id = _new_id("asg")
     attempt: dict[str, Any] = {
         "id": _new_id("att"),
@@ -695,7 +701,7 @@ def append_retry(record: dict[str, Any], assignment_id: str) -> dict[str, Any]:
     attempt: dict[str, Any] = {
         "id": _new_id("att"),
         "status": "prepared",
-        "created_at": _now(),
+        "created_at": utc_timestamp(),
     }
     latest_result = assignment["attempts"][-1].get("result", {})
     dispatch_context: dict[str, Any] = {}
@@ -785,7 +791,7 @@ def add_finding(
     evidence_ids: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Append a stable finding identity with an initial history entry."""
-    now = _now()
+    now = utc_timestamp()
     finding = {
         "id": _new_id("fnd"),
         "task_id": task_id,
@@ -833,7 +839,7 @@ def append_finding_evidence(
         finding["evidence_ids"].append(evidence_id)
     finding["history"].append(
         {
-            "at": _now(),
+            "at": utc_timestamp(),
             "action": action,
             "rationale": rationale.strip(),
             "evidence_ids": [evidence_id],
@@ -895,7 +901,7 @@ def resolve_check_finding(
         finding["evidence_ids"].append(evidence_id)
     finding["history"].append(
         {
-            "at": _now(),
+            "at": utc_timestamp(),
             "action": "resolved",
             "rationale": f"Check {check_id} passed for the current candidate",
             "evidence_ids": [evidence_id],
@@ -952,7 +958,7 @@ def resolve_finding(
         or assignment["method"] != "Review"
     ):
         raise RecordError("finding resolution requires current passing review evidence")
-    now = _now()
+    now = utc_timestamp()
     finding["status"] = "resolved"
     finding["evidence_ids"].append(evidence_id)
     finding["history"].append(
@@ -989,7 +995,7 @@ def add_evidence(
         "kind": kind,
         "outcome": outcome,
         "summary": summary,
-        "created_at": _now(),
+        "created_at": utc_timestamp(),
         "artifacts": [copy.deepcopy(dict(item)) for item in artifacts or ()],
         "source_provenance": copy.deepcopy(dict(source_provenance or {})),
         "tool_versions": copy.deepcopy(dict(tool_versions or {})),
