@@ -67,13 +67,13 @@
     - Bind merge-group checks and all three Fuse review levels to the provider's exact merge-group identity, including the base, merged prerequisite identities, and target head. A merge queue plus target-head match alone is insufficient. If the provider cannot atomically enforce that binding, refuse automatic enqueue and report the blocker.
     - Merge only the selected PR when current checks, all required review levels, unresolved-finding policy, and repository mergeability satisfy R4; otherwise continue monitoring or report the blocker.
 
-- [ ] T8 Route `/reconcile-spec` and task checkbox updates through the shared record  [id:T8 deps:T3,T5,T6 impl:R2,R3,R4,R5,D-RunControl,D-Coordinator]
+- [x] T8 Route `/reconcile-spec` and task checkbox updates through the shared record  [id:T8 deps:T3,T5,T6 impl:R2,R3,R4,R5,D-RunControl,D-Coordinator]
     - **Files:** `commands/reconcile-spec.md`, `skills/scripts/fuse_reconcile.py`, `tests/`
     - Test reconciliation against edited spec inputs, changed PR heads, absent or stale artifacts, accepted and unaccepted tasks, and out-of-band code changes.
     - Make the command load the canonical record, report spec/candidate/PR discrepancies, collect required missing evidence, and update status only through the transition validator. Never repair a mismatch by trusting a checkbox or rewriting approved intent.
     - Ensure ordinary non-managed reconciliation retains its current behavior and the managed path cannot create a parallel acceptance rule.
 
-- [ ] T9 Add shared CI/check entry points, end-to-end scenarios, and user documentation  [id:T9 deps:T1,T2,T4,T5,T6,T7,T8 impl:R1,R2,R3,R4,R5,R6,R7,R8,D-Coordinator,D-RunControl,D-PRIntegration,D-Verification]
+- [x] T9 Add shared CI/check entry points, end-to-end scenarios, and user documentation  [id:T9 deps:T1,T2,T4,T5,T6,T7,T8 impl:R1,R2,R3,R4,R5,R6,R7,R8,D-Coordinator,D-RunControl,D-PRIntegration,D-Verification]
     - **Files:** `.github/workflows/`, `.fuse/config.toml`, `schemas/project-config.schema.json`, `skills/scripts/fuse_candidate.py`, `skills/scripts/fuse_checks.py`, `commands/reconcile-spec.md`, `README.md`, `docs/user-guide.md`, `tests/`
     - Add end-to-end local-repository scenarios for a feature, bug fix, launch from outside the plugin root into a consuming repo, resume after an uncertain launch, forgotten verification, stale evidence, unavailable tools, review repair/carry-forward, and blocked work alongside unrelated progress.
     - Configure CI to invoke the same project-owned check entry point and definitions as local Fuse execution. Keep only provisioning, credentials, triggers, caching, and artifact transport specific to the workflow environment.
