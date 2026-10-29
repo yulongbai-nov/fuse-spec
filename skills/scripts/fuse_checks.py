@@ -86,6 +86,7 @@ class CheckResult(TypedDict):
 
 
 GIT_OBJECT_ID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+OUTPUT_METADATA_PREFIX = "fuse-check-output-v1 "
 
 
 def _is_git_object_id(value: Any) -> bool:
@@ -104,7 +105,7 @@ def _git(
 ) -> str:
     try:
         result = subprocess.run(
-            ["git", *arguments],
+            ["git", "--no-replace-objects", *arguments],
             cwd=root,
             env=env,
             input=input_data,
@@ -339,13 +340,12 @@ def _materialize_ignored_required_inputs(
             ) from error
 
 
-def _synthetic_candidate_commit(
+def _snapshot_tree(
     repository_root: Path,
     spec_dir: Path,
     manifest: Mapping[str, Any],
-    base_commit: str,
-    candidate_id: str,
-) -> tuple[str, str]:
+) -> str:
+    """Build the one canonical Git tree used for pinning and verification."""
     entries = _snapshot_entries(repository_root, spec_dir, manifest)
     with tempfile.TemporaryDirectory(prefix="fuse-index-") as index_directory:
         index_path = Path(index_directory) / "index"
@@ -365,27 +365,62 @@ def _synthetic_candidate_commit(
                 env=index_env,
                 input_data=index_data,
             )
-        tree_id = _git(repository_root, "write-tree", env=index_env)
-        author_env = os.environ.copy()
-        author_env.update(
-            {
-                "GIT_AUTHOR_NAME": "Fuse Candidate",
-                "GIT_AUTHOR_EMAIL": "fuse-candidate@example.invalid",
-                "GIT_COMMITTER_NAME": "Fuse Candidate",
-                "GIT_COMMITTER_EMAIL": "fuse-candidate@example.invalid",
-            }
-        )
-        commit_id = _git(
-            repository_root,
-            "commit-tree",
-            tree_id,
-            "-p",
-            base_commit,
-            "-m",
-            f"Fuse candidate {candidate_id}",
-            env=author_env,
-        )
+        return _git(repository_root, "write-tree", env=index_env)
+
+
+def _synthetic_candidate_commit(
+    repository_root: Path,
+    spec_dir: Path,
+    manifest: Mapping[str, Any],
+    base_commit: str,
+    candidate_id: str,
+) -> tuple[str, str]:
+    tree_id = _snapshot_tree(repository_root, spec_dir, manifest)
+    author_env = os.environ.copy()
+    author_env.update(
+        {
+            "GIT_AUTHOR_NAME": "Fuse Candidate",
+            "GIT_AUTHOR_EMAIL": "fuse-candidate@example.invalid",
+            "GIT_COMMITTER_NAME": "Fuse Candidate",
+            "GIT_COMMITTER_EMAIL": "fuse-candidate@example.invalid",
+        }
+    )
+    commit_id = _git(
+        repository_root,
+        "commit-tree",
+        tree_id,
+        "-p",
+        base_commit,
+        "-m",
+        f"Fuse candidate {candidate_id}",
+        env=author_env,
+    )
     return commit_id, tree_id
+
+
+@contextmanager
+def _detached_worktree(repository_root: Path, commit_id: str) -> Iterator[Path]:
+    with tempfile.TemporaryDirectory(prefix="fuse-check-") as temporary_directory:
+        worktree = Path(temporary_directory).resolve() / "worktree"
+        _git(
+            repository_root,
+            "-c",
+            "core.hooksPath=/dev/null",
+            "worktree",
+            "add",
+            "--detach",
+            str(worktree),
+            commit_id,
+        )
+        try:
+            yield worktree
+        finally:
+            subprocess.run(
+                ["git", "worktree", "remove", "--force", str(worktree)],
+                cwd=repository_root,
+                capture_output=True,
+                check=False,
+            )
 
 
 @contextmanager
@@ -400,19 +435,9 @@ def _pinned_worktree(
     commit_id, tree_id = _synthetic_candidate_commit(
         repository_root, spec_dir, manifest, base_commit, candidate_id
     )
-    with tempfile.TemporaryDirectory(prefix="fuse-check-") as temporary_directory:
-        worktree = Path(temporary_directory) / "worktree"
-        _git(repository_root, "worktree", "add", "--detach", str(worktree), commit_id)
-        try:
-            _materialize_ignored_required_inputs(repository_root, worktree, manifest)
-            yield worktree, commit_id, tree_id
-        finally:
-            subprocess.run(
-                ["git", "worktree", "remove", "--force", str(worktree)],
-                cwd=repository_root,
-                capture_output=True,
-                check=False,
-            )
+    with _detached_worktree(repository_root, commit_id) as worktree:
+        _materialize_ignored_required_inputs(repository_root, worktree, manifest)
+        yield worktree, commit_id, tree_id
 
 
 def _canonical_digest(value: Any) -> str:
@@ -666,15 +691,22 @@ def _candidate_matches_config(
         raise CheckError("candidate configuration context is stale")
 
 
-def _artifact_matches_provenance(
-    evidence: Mapping[str, Any], artifact_root: Path
-) -> bool:
+def _artifact_execution_metadata(
+    evidence: Mapping[str, Any], artifact_root: Path, config: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    """Read framed metadata only; command arguments and stdout cannot add headers."""
     output_artifacts = _required_output_artifacts(evidence)
-    if not output_artifacts:
-        return False
-    source = evidence.get("source_provenance")
-    if not isinstance(source, Mapping):
-        return False
+    source = evidence["source_provenance"]
+    expected = {
+        "candidate_id": evidence["candidate_id"],
+        "check_id": evidence["check_id"],
+        "command": config["checks"][evidence["check_id"]]["command"],
+        "config_digest": evidence["config_digest"],
+        "check_definition_digest": evidence["check_definition_digest"],
+        "source_commit": source["commit"],
+        "pinned_commit": source["pinned_worktree_commit"],
+        "pinned_tree": source["pinned_worktree_tree"],
+    }
     artifact_root_resolved = artifact_root.expanduser().resolve()
     for artifact in output_artifacts:
         relative = Path(str(artifact["path"]))
@@ -683,17 +715,90 @@ def _artifact_matches_provenance(
         try:
             artifact_path = (artifact_root_resolved / relative).resolve(strict=True)
             artifact_path.relative_to(artifact_root_resolved)
-            lines = artifact_path.read_text(encoding="utf-8").splitlines()
+            with artifact_path.open(encoding="utf-8") as stream:
+                header = stream.readline()
+            if not header.startswith(OUTPUT_METADATA_PREFIX):
+                continue
+            metadata = json.loads(header[len(OUTPUT_METADATA_PREFIX) :])
         except (OSError, UnicodeError, RuntimeError, ValueError):
             continue
-        expected_headers = [
-            f"source_commit={source.get('commit')}",
-            f"pinned_commit={source.get('pinned_worktree_commit')}",
-            f"pinned_tree={source.get('pinned_worktree_tree')}",
-        ]
-        if len(lines) >= 4 and lines[1:4] == expected_headers:
-            return True
-    return False
+        if not isinstance(metadata, dict) or any(
+            metadata.get(key) != value for key, value in expected.items()
+        ):
+            continue
+        exit_code = metadata.get("exit_code")
+        spec_dir = metadata.get("spec_dir")
+        if (
+            type(exit_code) is not int
+            or (evidence["outcome"] == "pass" and exit_code != 0)
+            or not isinstance(spec_dir, str)
+            or not spec_dir.strip()
+            or PurePosixPath(spec_dir).is_absolute()
+            or ".." in PurePosixPath(spec_dir).parts
+            or "\\" in spec_dir
+        ):
+            continue
+        return cast(Mapping[str, Any], metadata)
+    raise CheckError("check artifact execution metadata or provenance does not match")
+
+
+def _validate_pinned_candidate(
+    evidence: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    config: Mapping[str, Any],
+    artifact_root: Path,
+    metadata: Mapping[str, Any],
+) -> None:
+    """Bind an unsigned execution claim to real Git objects and candidate contents.
+
+    The canonical writer remains trusted to report execution honestly. Missing Git
+    objects or ignored fixtures make evidence unavailable; headers alone cannot
+    replace them. Provenance is deliberately outside the candidate content ID.
+    """
+    root = Path(_git(artifact_root.resolve(), "rev-parse", "--show-toplevel"))
+    source = evidence["source_provenance"]
+    for field, expected_type in (
+        ("commit", "commit"),
+        ("pinned_worktree_commit", "commit"),
+        ("pinned_worktree_tree", "tree"),
+    ):
+        if _git(root, "cat-file", "-t", source[field]) != expected_type:
+            raise CheckError(f"check provenance {field} is not a Git {expected_type}")
+    commit = _git(root, "cat-file", "commit", source["pinned_worktree_commit"])
+    headers, _, message = commit.partition("\n\n")
+    tree = [line[5:] for line in headers.splitlines() if line.startswith("tree ")]
+    parents = [line[7:] for line in headers.splitlines() if line.startswith("parent ")]
+    if tree != [source["pinned_worktree_tree"]] or parents != [source["commit"]]:
+        raise CheckError("check pinned commit tree or source provenance mismatch")
+    if message != f"Fuse candidate {candidate['candidate_id']}":
+        raise CheckError("check pinned commit is not bound to this candidate")
+
+    manifest = candidate["manifest"]
+    verification = manifest["verification_inputs"]
+    required_inputs = verification.get("required_inputs")
+    policy = verification.get("effective_policy")
+    if not isinstance(required_inputs, Mapping) or not isinstance(policy, Mapping):
+        raise CheckError("candidate required inputs or policy are malformed")
+    with _detached_worktree(root, source["pinned_worktree_commit"]) as worktree:
+        _materialize_ignored_required_inputs(root, worktree, manifest)
+        spec_dir = worktree / str(metadata["spec_dir"])
+        try:
+            actual_manifest = build_candidate_manifest(
+                worktree, spec_dir, policy, config, required_inputs=required_inputs
+            )
+        except (OSError, ValueError) as error:
+            raise CheckError(
+                f"pinned candidate inputs are unavailable: {error}"
+            ) from error
+        if actual_manifest != manifest:
+            raise CheckError("check pinned tree does not match candidate contents")
+        if (
+            _snapshot_tree(worktree, spec_dir, manifest)
+            != source["pinned_worktree_tree"]
+        ):
+            raise CheckError(
+                "check pinned tree is not the canonical candidate snapshot"
+            )
 
 
 def _validate_check_evidence_context(
@@ -720,10 +825,8 @@ def _validate_check_evidence_context(
         raise CheckError(f"check {check_id} evidence has no required output artifact")
     if not evidence_available(evidence, artifact_root):
         raise CheckError(f"check {check_id} evidence has a missing required artifact")
-    if not _artifact_matches_provenance(evidence, artifact_root):
-        raise CheckError(
-            f"check {check_id} artifact provenance does not match evidence"
-        )
+    metadata = _artifact_execution_metadata(evidence, artifact_root, config)
+    _validate_pinned_candidate(evidence, candidate, config, artifact_root, metadata)
 
 
 def run_check(
@@ -947,11 +1050,23 @@ def run_check(
             if candidate_changed
             else f"check {check_id} exited with code {completed.returncode}"
         )
+        metadata = {
+            "candidate_id": candidate_id,
+            "check_id": check_id,
+            "command": command,
+            "config_digest": _canonical_digest(config),
+            "check_definition_digest": _canonical_digest(check),
+            "source_commit": source["commit"],
+            "pinned_commit": pinned_commit,
+            "pinned_tree": pinned_tree,
+            "spec_dir": relative_spec.as_posix(),
+            "exit_code": completed.returncode,
+        }
         output = (
-            f"$ {' '.join(command)}\n"
-            f"source_commit={source['commit']}\n"
-            f"pinned_commit={pinned_commit}\n"
-            f"pinned_tree={pinned_tree}\n" + completed.stdout
+            OUTPUT_METADATA_PREFIX
+            + json.dumps(metadata, sort_keys=True)
+            + "\n[stdout]\n"
+            + completed.stdout
         )
         if completed.stderr:
             output += f"\n[stderr]\n{completed.stderr}"

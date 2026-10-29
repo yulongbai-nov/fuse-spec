@@ -193,6 +193,185 @@ def test_run_check_records_candidate_bound_command_and_output_artifact(
     )
 
 
+def test_self_consistent_forged_output_cannot_satisfy_check(tmp_path: Path) -> None:
+    root, spec_dir, config, policy = check_project(tmp_path)
+    record, candidate = record_with_candidate(root, spec_dir, config, policy)
+    append_check_evidence(
+        root,
+        record,
+        candidate["candidate_id"],
+        config,
+        check_id="tests",
+        outcome="pass",
+    )
+    missing_commit = subprocess.run(
+        ["git", "cat-file", "-e", "1" * 40],
+        cwd=root,
+        check=False,
+        capture_output=True,
+    )
+    assert missing_commit.returncode != 0
+    artifact_root = root / ".fuse" / "runs" / record["run_id"]
+
+    with pytest.raises(fuse_checks.CheckError, match="provenance|artifact|commit"):
+        fuse_checks.require_check_evidence(
+            record, "tests", candidate["candidate_id"], artifact_root, config
+        )
+    assert fuse_checks.ready_check_ids(
+        config, ["lint", "docs"], record, candidate["candidate_id"], artifact_root
+    ) == ["docs"]
+
+
+def test_multiline_command_output_is_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, spec_dir, config, policy = check_project(tmp_path)
+    config["checks"]["tests"]["command"] = [
+        sys.executable,
+        "-c",
+        "from pathlib import Path\n"
+        "assert Path('src/app.py').read_text() == 'value = 1\\n'\n"
+        "print('source_commit=untrusted stdout')\n",
+    ]
+    record, candidate = record_with_candidate(root, spec_dir, config, policy)
+    monkeypatch.setattr(
+        fuse_checks,
+        "prepare_toolchain",
+        lambda *_args: {"ready": True, "summary": "ready", "tool_versions": {}},
+    )
+
+    result = fuse_checks.run_check(
+        root, spec_dir, config, record, candidate["candidate_id"], "tests"
+    )
+    assert result["outcome"] == "pass"
+    artifact_root = root / ".fuse" / "runs" / record["run_id"]
+    assert (
+        fuse_checks.require_check_evidence(
+            record, "tests", candidate["candidate_id"], artifact_root, config
+        )
+        == record["evidence"][-1]
+    )
+    assert fuse_checks.ready_check_ids(
+        config, ["lint"], record, candidate["candidate_id"], artifact_root
+    ) == ["lint"]
+
+
+@pytest.mark.parametrize(
+    "forgery",
+    [
+        "missing_commit",
+        "missing_source",
+        "blob_commit",
+        "wrong_tree",
+        "wrong_content",
+        "extra_state",
+        "wrong_parent",
+        "wrong_candidate",
+        "replaced_commit",
+    ],
+)
+def test_matching_artifact_cannot_forge_git_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, forgery: str
+) -> None:
+    root, spec_dir, config, policy = check_project(tmp_path)
+    record, candidate = record_with_candidate(root, spec_dir, config, policy)
+    monkeypatch.setattr(
+        fuse_checks,
+        "prepare_toolchain",
+        lambda *_args: {"ready": True, "summary": "ready", "tool_versions": {}},
+    )
+    fuse_checks.run_check(
+        root, spec_dir, config, record, candidate["candidate_id"], "tests"
+    )
+    evidence = record["evidence"][-1]
+    source = evidence["source_provenance"]
+    updates: dict[str, str]
+    if forgery == "missing_commit":
+        updates = {"pinned_worktree_commit": "1" * 40}
+    elif forgery == "missing_source":
+        updates = {"commit": "2" * 40}
+    elif forgery == "blob_commit":
+        updates = {"pinned_worktree_commit": git(root, "hash-object", "src/app.py")}
+    elif forgery == "wrong_tree":
+        empty_tree = git(root, "mktree")
+        updates = {"pinned_worktree_tree": empty_tree}
+    else:
+        if forgery == "extra_state":
+            state = root / ".fuse" / "runs" / "other-run" / "run.json"
+            state.parent.mkdir(parents=True)
+            state.write_text("{}", encoding="utf-8")
+            git(root, "add", str(state))
+        elif forgery in {"wrong_content", "replaced_commit"}:
+            (root / "src" / "app.py").write_text("different source\n", encoding="utf-8")
+            git(root, "add", "src/app.py")
+        tree = git(root, "write-tree")
+        parent = source["commit"]
+        message = f"Fuse candidate {candidate['candidate_id']}"
+        if forgery == "wrong_parent":
+            git(root, "commit", "--allow-empty", "-m", "unrelated source")
+            parent = git(root, "rev-parse", "HEAD")
+        if forgery == "wrong_candidate":
+            message = f"Fuse candidate {'0' * 64}"
+        commit = git(root, "commit-tree", tree, "-p", parent, "-m", message)
+        if forgery == "replaced_commit":
+            git(root, "replace", commit, source["pinned_worktree_commit"])
+        updates = {"pinned_worktree_tree": tree, "pinned_worktree_commit": commit}
+    artifact_root = root / ".fuse" / "runs" / record["run_id"]
+    artifact = evidence["artifacts"][0]
+    path = artifact_root / artifact["path"]
+    content = path.read_text(encoding="utf-8")
+    for field, replacement in updates.items():
+        content = content.replace(source[field], replacement)
+        source[field] = replacement
+    path.write_text(content, encoding="utf-8")
+    artifact["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    with pytest.raises(fuse_checks.CheckError, match="git|provenance|candidate|tree"):
+        fuse_checks.require_check_evidence(
+            record, "tests", candidate["candidate_id"], artifact_root, config
+        )
+    assert fuse_checks.ready_check_ids(
+        config, ["lint", "docs"], record, candidate["candidate_id"], artifact_root
+    ) == ["docs"]
+    assert git(root, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+def test_evidence_survives_metadata_commits_with_separate_source_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, spec_dir, config, policy = check_project(tmp_path)
+    record, candidate = record_with_candidate(root, spec_dir, config, policy)
+    original_commit = candidate["source_provenance"]["commit"]
+    tasks = spec_dir / "tasks.md"
+    tasks.write_text(tasks.read_text().replace("[ ]", "[x]"), encoding="utf-8")
+    git(root, "add", "-A")
+    git(root, "commit", "-m", "task checkbox projection")
+    git(root, "commit", "--allow-empty", "-m", "metadata only")
+    assert fuse_candidate.capture_candidate(record, root, spec_dir, config) == candidate
+    monkeypatch.setattr(
+        fuse_checks,
+        "prepare_toolchain",
+        lambda *_args: {"ready": True, "summary": "ready", "tool_versions": {}},
+    )
+    fuse_checks.run_check(
+        root, spec_dir, config, record, candidate["candidate_id"], "tests"
+    )
+    evidence = record["evidence"][-1]
+    assert evidence["source_provenance"]["commit"] != original_commit
+    git(root, "commit", "--allow-empty", "-m", "later metadata")
+
+    assert (
+        fuse_checks.require_check_evidence(
+            record,
+            "tests",
+            candidate["candidate_id"],
+            root / ".fuse" / "runs" / record["run_id"],
+            config,
+        )
+        == evidence
+    )
+
+
 def test_check_runs_in_detached_snapshot_of_dirty_candidate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -286,6 +465,18 @@ def test_snapshot_materializes_ignored_required_input_and_normalizes_task_status
     )
 
     assert result["outcome"] == "pass"
+    artifact_root = root / ".fuse" / "runs" / record["run_id"]
+    assert (
+        fuse_checks.require_check_evidence(
+            record, "tests", candidate["candidate_id"], artifact_root, config
+        )
+        == record["evidence"][-1]
+    )
+    fixture.unlink()
+    with pytest.raises(fuse_checks.CheckError, match="required input"):
+        fuse_checks.require_check_evidence(
+            record, "tests", candidate["candidate_id"], artifact_root, config
+        )
 
 
 def test_check_mutation_is_isolated_and_invalidates_snapshot_evidence(
