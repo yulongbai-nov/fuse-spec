@@ -1,0 +1,940 @@
+#!/usr/bin/env python3
+"""Prepare locked project tools and record candidate-bound check results."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import stat
+import subprocess
+import tempfile
+import uuid
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import contextmanager
+from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING, Any, TypedDict, cast
+
+if TYPE_CHECKING:
+    from fuse_candidate import (
+        build_candidate_manifest,
+        normalize_task_checkboxes,
+        source_provenance,
+    )
+    from fuse_config import _validate_project_toolchain, validate_config
+    from fuse_graph import (
+        applicable_check_graph,
+    )
+    from fuse_graph import (
+        ready_check_ids as graph_ready_check_ids,
+    )
+    from fuse_record import add_evidence, evidence_available, validate_run_record
+else:
+    try:
+        from .fuse_candidate import (
+            build_candidate_manifest,
+            normalize_task_checkboxes,
+            source_provenance,
+        )
+        from .fuse_config import _validate_project_toolchain, validate_config
+        from .fuse_graph import (
+            applicable_check_graph,
+        )
+        from .fuse_graph import (
+            ready_check_ids as graph_ready_check_ids,
+        )
+        from .fuse_record import add_evidence, evidence_available, validate_run_record
+    except ImportError:
+        from fuse_candidate import (
+            build_candidate_manifest,
+            normalize_task_checkboxes,
+            source_provenance,
+        )
+        from fuse_config import _validate_project_toolchain, validate_config
+        from fuse_graph import (
+            applicable_check_graph,
+        )
+        from fuse_graph import (
+            ready_check_ids as graph_ready_check_ids,
+        )
+        from fuse_record import add_evidence, evidence_available, validate_run_record
+
+
+class CheckError(ValueError):
+    """Raised when check inputs or candidate-bound evidence are invalid."""
+
+
+class ToolchainPreparation(TypedDict):
+    """Result of verifying/restoring the project's selected locked tools."""
+
+    ready: bool
+    summary: str
+    tool_versions: dict[str, str]
+
+
+class CheckResult(TypedDict):
+    """Concise result returned after a configured check is recorded."""
+
+    check_id: str
+    candidate_id: str
+    outcome: str
+    exit_code: int | None
+    summary: str
+    evidence_id: str
+
+
+def _git(
+    root: Path,
+    *arguments: str,
+    env: Mapping[str, str] | None = None,
+    input_data: bytes | None = None,
+) -> str:
+    try:
+        result = subprocess.run(
+            ["git", *arguments],
+            cwd=root,
+            env=env,
+            input=input_data,
+            capture_output=True,
+            check=False,
+        )
+    except OSError as error:
+        raise CheckError(f"cannot run git {' '.join(arguments)}: {error}") from error
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise CheckError(f"git {' '.join(arguments)} failed: {detail}")
+    return result.stdout.decode("utf-8", errors="replace").strip()
+
+
+def _blob_id(repository_root: Path, content: bytes) -> str:
+    return _git(repository_root, "hash-object", "-w", "--stdin", input_data=content)
+
+
+def _source_blob(
+    repository_root: Path, relative: str, expected: Mapping[str, Any]
+) -> tuple[str, str]:
+    path = PurePosixPath(relative)
+    source = repository_root.joinpath(*path.parts)
+    try:
+        metadata = source.lstat()
+    except OSError as error:
+        raise CheckError(
+            f"candidate input disappeared while pinning: {relative}"
+        ) from error
+
+    kind = expected.get("kind")
+    if kind == "file" and stat.S_ISREG(metadata.st_mode):
+        try:
+            content = source.read_bytes()
+        except OSError as error:
+            raise CheckError(
+                f"cannot read candidate input {relative}: {error}"
+            ) from error
+        digest = hashlib.sha256(content).hexdigest()
+        executable = bool(metadata.st_mode & stat.S_IXUSR)
+        if digest != expected.get("sha256") or executable != expected.get("executable"):
+            raise CheckError(f"candidate input changed while pinning: {relative}")
+        return (
+            "100755" if executable else "100644",
+            _blob_id(repository_root, content),
+        )
+    if kind == "symlink" and stat.S_ISLNK(metadata.st_mode):
+        try:
+            source.resolve(strict=False).relative_to(repository_root)
+        except (RuntimeError, ValueError) as error:
+            raise CheckError(
+                f"candidate symlink escapes repository: {relative}"
+            ) from error
+        content = os.readlink(source).encode("utf-8", errors="surrogateescape")
+        if hashlib.sha256(content).hexdigest() != expected.get("target_sha256"):
+            raise CheckError(f"candidate symlink changed while pinning: {relative}")
+        return "120000", _blob_id(repository_root, content)
+    raise CheckError(f"candidate input has an unsupported type: {relative}")
+
+
+def _snapshot_entries(
+    repository_root: Path,
+    spec_dir: Path,
+    manifest: Mapping[str, Any],
+) -> list[tuple[str, str, str]]:
+    verification = manifest.get("verification_inputs")
+    if not isinstance(verification, Mapping):
+        raise CheckError("candidate verification manifest is malformed")
+    source_tree = verification.get("source_tree")
+    approved_spec = verification.get("approved_spec")
+    required_inputs = verification.get("required_inputs")
+    if (
+        not isinstance(source_tree, Mapping)
+        or not isinstance(approved_spec, Mapping)
+        or not isinstance(required_inputs, Mapping)
+    ):
+        raise CheckError(
+            "candidate source, spec, or required-input manifest is malformed"
+        )
+
+    entries: list[tuple[str, str, str]] = []
+    for raw_path, source_info in sorted(source_tree.items()):
+        if not isinstance(raw_path, str) or not isinstance(source_info, Mapping):
+            raise CheckError("candidate source manifest contains an invalid entry")
+        mode, object_id = _source_blob(repository_root, raw_path, source_info)
+        entries.append((mode, object_id, raw_path))
+
+    try:
+        relative_spec = spec_dir.resolve(strict=True).relative_to(repository_root)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise CheckError("approved spec directory is outside the repository") from error
+    for raw_name, expected_digest in sorted(approved_spec.items()):
+        if not isinstance(raw_name, str) or not isinstance(expected_digest, str):
+            raise CheckError("approved spec manifest contains an invalid entry")
+        if PurePosixPath(raw_name).name != raw_name or raw_name in {".", ".."}:
+            raise CheckError("approved spec manifest contains an invalid file name")
+        spec_path = spec_dir / raw_name
+        try:
+            content = spec_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            raise CheckError(
+                f"cannot read approved spec input {raw_name}: {error}"
+            ) from error
+        normalized = (
+            normalize_task_checkboxes(content) if raw_name == "tasks.md" else content
+        )
+        if hashlib.sha256(normalized.encode("utf-8")).hexdigest() != expected_digest:
+            raise CheckError(f"approved spec input changed while pinning: {raw_name}")
+        raw_content = normalized.encode("utf-8")
+        spec_path_in_tree = (relative_spec / raw_name).as_posix()
+        entries.append(
+            ("100644", _blob_id(repository_root, raw_content), spec_path_in_tree)
+        )
+
+    for raw_path, input_info in sorted(required_inputs.items()):
+        if (
+            not isinstance(raw_path, str)
+            or not isinstance(input_info, Mapping)
+            or not isinstance(input_info.get("sha256"), str)
+            or type(input_info.get("executable")) is not bool
+        ):
+            raise CheckError("required-input manifest contains an invalid entry")
+        relative = PurePosixPath(raw_path)
+        if (
+            not raw_path.strip()
+            or relative.is_absolute()
+            or ".." in relative.parts
+            or "\\" in raw_path
+        ):
+            raise CheckError("required-input manifest contains an invalid path")
+        if raw_path in source_tree:
+            source_info = source_tree[raw_path]
+            if not isinstance(source_info, Mapping):
+                raise CheckError(
+                    f"required input has an invalid source entry: {raw_path}"
+                )
+            if source_info.get("kind") == "file":
+                if (
+                    source_info.get("sha256") != input_info["sha256"]
+                    or source_info.get("executable") != input_info["executable"]
+                ):
+                    raise CheckError(
+                        f"required input changed while pinning: {raw_path}"
+                    )
+            elif source_info.get("kind") == "symlink":
+                target = repository_root.joinpath(*relative.parts).resolve(strict=True)
+                try:
+                    target_relative = target.relative_to(repository_root).as_posix()
+                except ValueError as error:
+                    raise CheckError(
+                        f"required input symlink escapes repository: {raw_path}"
+                    ) from error
+                target_info = source_tree.get(target_relative)
+                if (
+                    not isinstance(target_info, Mapping)
+                    or target_info.get("kind") != "file"
+                    or target_info.get("sha256") != input_info["sha256"]
+                    or target_info.get("executable") != input_info["executable"]
+                ):
+                    raise CheckError(
+                        f"required input symlink target is not in candidate source: "
+                        f"{raw_path}"
+                    )
+            else:
+                raise CheckError(f"required input is not a candidate file: {raw_path}")
+    return entries
+
+
+def _materialize_ignored_required_inputs(
+    repository_root: Path, worktree: Path, manifest: Mapping[str, Any]
+) -> None:
+    verification = manifest.get("verification_inputs")
+    if not isinstance(verification, Mapping):
+        raise CheckError("candidate verification manifest is malformed")
+    source_tree = verification.get("source_tree")
+    required_inputs = verification.get("required_inputs")
+    if not isinstance(source_tree, Mapping) or not isinstance(required_inputs, Mapping):
+        raise CheckError("candidate source or required-input manifest is malformed")
+
+    for raw_path, input_info in sorted(required_inputs.items()):
+        if raw_path in source_tree:
+            continue
+        if (
+            not isinstance(raw_path, str)
+            or not isinstance(input_info, Mapping)
+            or not isinstance(input_info.get("sha256"), str)
+            or type(input_info.get("executable")) is not bool
+        ):
+            raise CheckError("required-input manifest contains an invalid entry")
+        relative = PurePosixPath(raw_path)
+        source = repository_root.joinpath(*relative.parts)
+        try:
+            metadata = source.lstat()
+            resolved = source.resolve(strict=True)
+            resolved.relative_to(repository_root)
+        except (OSError, RuntimeError, ValueError) as error:
+            raise CheckError(
+                f"cannot materialize required input {raw_path}: {error}"
+            ) from error
+        if not stat.S_ISREG(metadata.st_mode):
+            raise CheckError(
+                f"ignored required input must be a regular file: {raw_path}"
+            )
+        try:
+            content = source.read_bytes()
+        except OSError as error:
+            raise CheckError(
+                f"cannot read required input {raw_path}: {error}"
+            ) from error
+        executable = bool(metadata.st_mode & stat.S_IXUSR)
+        if (
+            hashlib.sha256(content).hexdigest() != input_info["sha256"]
+            or executable != input_info["executable"]
+        ):
+            raise CheckError(f"required input changed while pinning: {raw_path}")
+        destination = worktree.joinpath(*relative.parts)
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.resolve(strict=False).relative_to(worktree.resolve())
+        except (OSError, RuntimeError, ValueError) as error:
+            raise CheckError(
+                f"required input path escapes candidate: {raw_path}"
+            ) from error
+        if os.path.lexists(destination):
+            raise CheckError(f"required input path collides in candidate: {raw_path}")
+        try:
+            destination.write_bytes(content)
+            destination.chmod(0o755 if executable else 0o644)
+        except OSError as error:
+            raise CheckError(
+                f"cannot materialize required input {raw_path}: {error}"
+            ) from error
+
+
+def _synthetic_candidate_commit(
+    repository_root: Path,
+    spec_dir: Path,
+    manifest: Mapping[str, Any],
+    base_commit: str,
+    candidate_id: str,
+) -> tuple[str, str]:
+    entries = _snapshot_entries(repository_root, spec_dir, manifest)
+    with tempfile.TemporaryDirectory(prefix="fuse-index-") as index_directory:
+        index_path = Path(index_directory) / "index"
+        index_env = os.environ.copy()
+        index_env["GIT_INDEX_FILE"] = str(index_path)
+        _git(repository_root, "read-tree", "--empty", env=index_env)
+        index_data = b"".join(
+            f"{mode} {object_id}\t{path}\0".encode("utf-8", errors="surrogateescape")
+            for mode, object_id, path in entries
+        )
+        if index_data:
+            _git(
+                repository_root,
+                "update-index",
+                "-z",
+                "--index-info",
+                env=index_env,
+                input_data=index_data,
+            )
+        tree_id = _git(repository_root, "write-tree", env=index_env)
+        author_env = os.environ.copy()
+        author_env.update(
+            {
+                "GIT_AUTHOR_NAME": "Fuse Candidate",
+                "GIT_AUTHOR_EMAIL": "fuse-candidate@example.invalid",
+                "GIT_COMMITTER_NAME": "Fuse Candidate",
+                "GIT_COMMITTER_EMAIL": "fuse-candidate@example.invalid",
+            }
+        )
+        commit_id = _git(
+            repository_root,
+            "commit-tree",
+            tree_id,
+            "-p",
+            base_commit,
+            "-m",
+            f"Fuse candidate {candidate_id}",
+            env=author_env,
+        )
+    return commit_id, tree_id
+
+
+@contextmanager
+def _pinned_worktree(
+    repository_root: Path,
+    spec_dir: Path,
+    manifest: Mapping[str, Any],
+    base_commit: str,
+    candidate_id: str,
+) -> Iterator[tuple[Path, str, str]]:
+    """Create a detached temporary worktree for the exact captured candidate."""
+    commit_id, tree_id = _synthetic_candidate_commit(
+        repository_root, spec_dir, manifest, base_commit, candidate_id
+    )
+    with tempfile.TemporaryDirectory(prefix="fuse-check-") as temporary_directory:
+        worktree = Path(temporary_directory) / "worktree"
+        _git(repository_root, "worktree", "add", "--detach", str(worktree), commit_id)
+        try:
+            _materialize_ignored_required_inputs(repository_root, worktree, manifest)
+            yield worktree, commit_id, tree_id
+        finally:
+            subprocess.run(
+                ["git", "worktree", "remove", "--force", str(worktree)],
+                cwd=repository_root,
+                capture_output=True,
+                check=False,
+            )
+
+
+def _canonical_digest(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _safe_version(
+    command: list[str], repository_root: Path, *, timeout: float = 10
+) -> str:
+    try:
+        result = subprocess.run(
+            command,
+            cwd=repository_root,
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "unavailable"
+    output = (result.stdout or result.stderr).strip()
+    return output if result.returncode == 0 and output else "unavailable"
+
+
+def prepare_toolchain(
+    repository_root: Path, config: Mapping[str, Any]
+) -> ToolchainPreparation:
+    """Restore selected project tools only through the configured locked manager."""
+    root = repository_root.expanduser().resolve()
+    try:
+        validate_config(config)
+        toolchain = config["toolchain"]
+        _validate_project_toolchain(root, toolchain)
+    except (KeyError, ValueError, OSError) as error:
+        return {
+            "ready": False,
+            "summary": f"selected toolchain is unavailable: {error}",
+            "tool_versions": {},
+        }
+
+    manager = str(toolchain["package_manager"])
+    if (
+        toolchain["runtime"] != "python"
+        or manager != "uv"
+        or toolchain["restore_policy"]
+        != "selected_tools_existing_version_and_lock_only"
+        or toolchain["selection_policy"] != "reuse_existing"
+    ):
+        return {
+            "ready": False,
+            "summary": "selected toolchain has no supported locked restore operation",
+            "tool_versions": {},
+        }
+    if shutil.which(manager) is None:
+        return {
+            "ready": False,
+            "summary": f"selected package manager {manager!r} is unavailable",
+            "tool_versions": {},
+        }
+
+    try:
+        sync = subprocess.run(
+            [manager, "sync", "--locked"],
+            cwd=root,
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=1200,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {
+            "ready": False,
+            "summary": f"locked tool restore failed: {error}",
+            "tool_versions": {"package_manager": manager},
+        }
+    if sync.returncode != 0:
+        detail = (sync.stderr or sync.stdout).strip()
+        return {
+            "ready": False,
+            "summary": f"{manager} sync --locked failed: {detail}",
+            "tool_versions": {"package_manager": manager},
+        }
+
+    manager_version = _safe_version([manager, "--version"], root)
+    runtime = _safe_version([manager, "run", "--locked", "python", "--version"], root)
+    lockfile_path = root / str(toolchain["lockfile"])
+    try:
+        lockfile_digest = hashlib.sha256(lockfile_path.read_bytes()).hexdigest()
+    except OSError:
+        lockfile_digest = "unavailable"
+    return {
+        "ready": True,
+        "summary": f"{manager} synchronized the selected lockfile",
+        "tool_versions": {
+            "package_manager": manager_version,
+            "runtime": runtime,
+            "lockfile_sha256": lockfile_digest,
+        },
+    }
+
+
+def _check_tool_version(command: list[str], manager: str, repository_root: Path) -> str:
+    if command[:3] == [manager, "run", "--locked"] and len(command) >= 4:
+        if command[3] == "python" and command[4:5] == ["-m"] and len(command) >= 6:
+            probe = [*command[:6], "--version"]
+        else:
+            probe = [*command[:4], "--version"]
+    else:
+        probe = [command[0], "--version"]
+    return _safe_version(probe, repository_root)
+
+
+def _write_output_artifact(
+    repository_root: Path,
+    run_id: str,
+    candidate_id: str,
+    check_id: str,
+    content: bytes,
+) -> dict[str, Any]:
+    relative = Path("artifacts") / "checks" / candidate_id / f"{check_id}.log"
+    run_root = (repository_root / ".fuse" / "runs" / run_id).resolve(strict=False)
+    try:
+        run_root.relative_to(repository_root)
+    except ValueError as error:
+        raise CheckError(
+            "run artifact directory resolves outside the repository"
+        ) from error
+    destination = run_root / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.tmp-{uuid.uuid4().hex}")
+    try:
+        with temporary.open("xb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+    except OSError:
+        temporary.unlink(missing_ok=True)
+        raise
+    return {
+        "path": relative.as_posix(),
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "required": True,
+    }
+
+
+def _record_result(
+    record: dict[str, Any],
+    candidate_id: str,
+    check_id: str,
+    outcome: str,
+    summary: str,
+    source: Mapping[str, Any],
+    tool_versions: Mapping[str, str],
+    config: Mapping[str, Any],
+    artifacts: list[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    check = config["checks"][check_id]
+    return add_evidence(
+        record,
+        candidate_id,
+        "check",
+        outcome,
+        summary,
+        check_id=check_id,
+        artifacts=artifacts,
+        source_provenance=source,
+        tool_versions=tool_versions,
+        config_digest=_canonical_digest(config),
+        check_definition_digest=_canonical_digest(check),
+    )
+
+
+def _has_required_output_artifact(evidence: Mapping[str, Any]) -> bool:
+    artifacts = evidence.get("artifacts", ())
+    return isinstance(artifacts, list) and any(
+        isinstance(artifact, Mapping) and artifact.get("required") is True
+        for artifact in artifacts
+    )
+
+
+def _has_check_provenance(evidence: Mapping[str, Any]) -> bool:
+    source = evidence.get("source_provenance")
+    tool_versions = evidence.get("tool_versions")
+    return (
+        bool(evidence.get("config_digest"))
+        and bool(evidence.get("check_definition_digest"))
+        and isinstance(source, Mapping)
+        and isinstance(source.get("commit"), str)
+        and isinstance(source.get("pinned_worktree_commit"), str)
+        and isinstance(source.get("pinned_worktree_tree"), str)
+        and isinstance(tool_versions, Mapping)
+        and bool(tool_versions)
+    )
+
+
+def run_check(
+    repository_root: Path,
+    spec_dir: Path,
+    config: Mapping[str, Any],
+    record: dict[str, Any],
+    candidate_id: str,
+    check_id: str,
+) -> CheckResult:
+    """Run one configured check in a pinned worktree and append its evidence."""
+    root = repository_root.expanduser().resolve()
+    validate_run_record(record)
+    try:
+        validate_config(config)
+    except ValueError as error:
+        raise CheckError(f"project configuration is invalid: {error}") from error
+    if check_id not in config["checks"]:
+        raise CheckError(f"unknown project check {check_id}")
+    candidate = next(
+        (item for item in record["candidates"] if item["candidate_id"] == candidate_id),
+        None,
+    )
+    if candidate is None:
+        raise CheckError(f"candidate {candidate_id} is missing from the run record")
+    verification_inputs = candidate["manifest"].get("verification_inputs", {})
+    required_inputs = verification_inputs.get("required_inputs", {})
+    if not isinstance(required_inputs, Mapping):
+        raise CheckError("candidate required-input manifest is invalid")
+    try:
+        current_manifest = build_candidate_manifest(
+            root,
+            spec_dir,
+            record["effective_policy_snapshot"],
+            config,
+            required_inputs=required_inputs.keys(),
+        )
+    except ValueError as error:
+        raise CheckError(f"candidate is stale: {error}") from error
+    if current_manifest != candidate["manifest"]:
+        raise CheckError(f"candidate is stale before check {check_id}")
+
+    check = config["checks"][check_id]
+    command = list(check["command"])
+    if check["pass_criteria"] != "exit_code == 0":
+        source = source_provenance(root)
+        evidence = _record_result(
+            record,
+            candidate_id,
+            check_id,
+            "unavailable",
+            "unsupported pass criteria; only 'exit_code == 0' is executable",
+            source,
+            {},
+            config,
+        )
+        return {
+            "check_id": check_id,
+            "candidate_id": candidate_id,
+            "outcome": "unavailable",
+            "exit_code": None,
+            "summary": evidence["summary"],
+            "evidence_id": evidence["id"],
+        }
+
+    source = source_provenance(root)
+    try:
+        relative_spec = spec_dir.expanduser().resolve(strict=True).relative_to(root)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise CheckError("approved spec directory is outside the repository") from error
+
+    with _pinned_worktree(
+        root,
+        spec_dir,
+        candidate["manifest"],
+        str(source["commit"]),
+        candidate_id,
+    ) as (check_root, pinned_commit, pinned_tree):
+        check_spec_dir = check_root / relative_spec
+        try:
+            pinned_manifest = build_candidate_manifest(
+                check_root,
+                check_spec_dir,
+                record["effective_policy_snapshot"],
+                config,
+                required_inputs=required_inputs.keys(),
+            )
+        except ValueError as error:
+            raise CheckError(f"candidate snapshot is invalid: {error}") from error
+        if pinned_manifest != candidate["manifest"]:
+            raise CheckError(f"candidate snapshot does not match {candidate_id}")
+
+        pinned_source = dict(source)
+        pinned_source["pinned_worktree_commit"] = pinned_commit
+        pinned_source["pinned_worktree_tree"] = pinned_tree
+        preparation = prepare_toolchain(check_root, config)
+        tool_versions = dict(preparation["tool_versions"])
+        if not preparation["ready"]:
+            evidence = _record_result(
+                record,
+                candidate_id,
+                check_id,
+                "unavailable",
+                preparation["summary"],
+                pinned_source,
+                tool_versions,
+                config,
+            )
+            return {
+                "check_id": check_id,
+                "candidate_id": candidate_id,
+                "outcome": "unavailable",
+                "exit_code": None,
+                "summary": evidence["summary"],
+                "evidence_id": evidence["id"],
+            }
+
+        try:
+            prepared_manifest = build_candidate_manifest(
+                check_root,
+                check_spec_dir,
+                record["effective_policy_snapshot"],
+                config,
+                required_inputs=required_inputs.keys(),
+            )
+        except ValueError:
+            prepared_manifest = None
+        if prepared_manifest != candidate["manifest"]:
+            evidence = _record_result(
+                record,
+                candidate_id,
+                check_id,
+                "inconclusive",
+                "candidate snapshot changed during toolchain preparation",
+                pinned_source,
+                tool_versions,
+                config,
+            )
+            return {
+                "check_id": check_id,
+                "candidate_id": candidate_id,
+                "outcome": "inconclusive",
+                "exit_code": None,
+                "summary": evidence["summary"],
+                "evidence_id": evidence["id"],
+            }
+
+        tool_versions["check_command"] = _check_tool_version(
+            command, str(config["toolchain"]["package_manager"]), check_root
+        )
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=check_root,
+                capture_output=True,
+                check=False,
+                text=True,
+                errors="replace",
+            )
+        except OSError as error:
+            evidence = _record_result(
+                record,
+                candidate_id,
+                check_id,
+                "unavailable",
+                f"configured command is unavailable: {error}",
+                pinned_source,
+                tool_versions,
+                config,
+            )
+            return {
+                "check_id": check_id,
+                "candidate_id": candidate_id,
+                "outcome": "unavailable",
+                "exit_code": None,
+                "summary": evidence["summary"],
+                "evidence_id": evidence["id"],
+            }
+
+        try:
+            after_manifest = build_candidate_manifest(
+                check_root,
+                check_spec_dir,
+                record["effective_policy_snapshot"],
+                config,
+                required_inputs=required_inputs.keys(),
+            )
+        except ValueError:
+            after_manifest = None
+        candidate_changed = (
+            after_manifest != candidate["manifest"]
+            or _git(check_root, "rev-parse", "HEAD") != pinned_commit
+        )
+        outcome = (
+            "inconclusive"
+            if candidate_changed
+            else "pass"
+            if completed.returncode == 0
+            else "fail"
+        )
+        summary = (
+            f"candidate snapshot changed while check {check_id} was running"
+            if candidate_changed
+            else f"check {check_id} exited with code {completed.returncode}"
+        )
+        output = (
+            f"$ {' '.join(command)}\n"
+            f"pinned_commit={pinned_commit}\n"
+            f"pinned_tree={pinned_tree}\n" + completed.stdout
+        )
+        if completed.stderr:
+            output += f"\n[stderr]\n{completed.stderr}"
+        output_bytes = output.encode("utf-8", errors="replace")
+        try:
+            artifact = _write_output_artifact(
+                root, record["run_id"], candidate_id, check_id, output_bytes
+            )
+        except OSError as error:
+            evidence = _record_result(
+                record,
+                candidate_id,
+                check_id,
+                "unavailable",
+                f"cannot persist required check output: {error}",
+                pinned_source,
+                tool_versions,
+                config,
+            )
+            return {
+                "check_id": check_id,
+                "candidate_id": candidate_id,
+                "outcome": "unavailable",
+                "exit_code": completed.returncode,
+                "summary": evidence["summary"],
+                "evidence_id": evidence["id"],
+            }
+
+        evidence = _record_result(
+            record,
+            candidate_id,
+            check_id,
+            outcome,
+            summary,
+            pinned_source,
+            tool_versions,
+            config,
+            artifacts=[artifact],
+        )
+        return {
+            "check_id": check_id,
+            "candidate_id": candidate_id,
+            "outcome": outcome,
+            "exit_code": completed.returncode,
+            "summary": summary,
+            "evidence_id": evidence["id"],
+        }
+
+
+def ready_check_ids(
+    config: Mapping[str, Any],
+    applicable: Iterable[str],
+    record: Mapping[str, Any],
+    candidate_id: str,
+    artifact_root: Path,
+) -> list[str]:
+    """Return applicable checks with current candidate-matched prerequisites."""
+    validate_run_record(record)
+    checks = config["checks"]
+    applicable_checks = list(applicable)
+    graph = applicable_check_graph(checks, applicable_checks)
+    completed: set[str] = set()
+    blocked: set[str] = set()
+    latest: dict[str, Mapping[str, Any]] = {}
+    for evidence in record["evidence"]:
+        if (
+            evidence["kind"] == "check"
+            and evidence.get("candidate_id") == candidate_id
+            and evidence.get("check_id") in graph
+        ):
+            latest[str(evidence["check_id"])] = evidence
+    for check_id, evidence in latest.items():
+        if (
+            evidence["outcome"] == "pass"
+            and _has_required_output_artifact(evidence)
+            and _has_check_provenance(evidence)
+            and evidence_available(evidence, artifact_root)
+        ):
+            completed.add(check_id)
+        else:
+            blocked.add(check_id)
+    return graph_ready_check_ids(
+        checks,
+        applicable_checks,
+        completed=completed,
+        blocked=blocked,
+    )
+
+
+def require_check_evidence(
+    record: Mapping[str, Any],
+    check_id: str,
+    candidate_id: str,
+    artifact_root: Path,
+) -> Mapping[str, Any]:
+    """Require the latest check result to pass for the exact candidate."""
+    validate_run_record(record)
+    candidates = record["candidates"]
+    candidate_ids = {item["candidate_id"] for item in candidates}
+    if candidate_id not in candidate_ids:
+        raise CheckError(f"candidate {candidate_id} is stale or missing")
+    all_check_evidence = [
+        evidence
+        for evidence in record["evidence"]
+        if evidence["kind"] == "check" and evidence.get("check_id") == check_id
+    ]
+    if all_check_evidence and all_check_evidence[-1]["candidate_id"] != candidate_id:
+        raise CheckError(f"check {check_id} evidence is for a stale candidate")
+    matching = [
+        evidence
+        for evidence in all_check_evidence
+        if evidence["candidate_id"] == candidate_id
+    ]
+    if not matching:
+        if all_check_evidence:
+            raise CheckError(f"check {check_id} evidence is for a stale candidate")
+        raise CheckError(f"check {check_id} evidence is missing")
+    evidence = matching[-1]
+    if evidence["outcome"] != "pass":
+        raise CheckError(f"check {check_id} evidence is not passing")
+    if not _has_required_output_artifact(evidence):
+        raise CheckError(f"check {check_id} evidence has no required output artifact")
+    if not evidence_available(evidence, artifact_root):
+        raise CheckError(f"check {check_id} evidence has a missing required artifact")
+    if not _has_check_provenance(evidence):
+        raise CheckError(f"check {check_id} evidence has incomplete provenance")
+    return cast(Mapping[str, Any], evidence)
