@@ -7,7 +7,7 @@
 
 ## Tasks
 
-- [ ] T1 Add the locked development setup and regression coverage for existing helpers  [id:T1 deps: impl:R3,R8,D-RunControl,D-Verification]
+- [x] T1 Add the locked development setup and regression coverage for existing helpers  [id:T1 deps: impl:R3,R8,D-RunControl,D-Verification]
     - **Files:** `pyproject.toml`, `.python-version`, `uv.lock`, `skills/scripts/plan_waves.py`, `skills/scripts/sync_check.py`, `skills/scripts/next_spec_number.py`, `tests/`
     - Add pytest cases first for the observed missing-spec, duplicate-task-ID, checkbox-only completion, invalid-dependency, cycle, and overlapping-write-scope cases; verify the new cases fail against the current helpers.
     - Add the Python >=3.11 project environment with uv, pytest, Ruff, mypy, and the selected runtime dependency; pin versions in `uv.lock`. Configure their project settings in `pyproject.toml` and invoke them through locked `uv run` commands. T9 owns the unified local/CI check entry point so the command list has one owner.
