@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -82,6 +83,17 @@ class CheckResult(TypedDict):
     exit_code: int | None
     summary: str
     evidence_id: str
+
+
+GIT_OBJECT_ID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+
+
+def _is_git_object_id(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and GIT_OBJECT_ID.fullmatch(value) is not None
+        and set(value) != {"0"}
+    )
 
 
 def _git(
@@ -527,25 +539,42 @@ def _write_output_artifact(
     check_id: str,
     content: bytes,
 ) -> dict[str, Any]:
-    relative = Path("artifacts") / "checks" / candidate_id / f"{check_id}.log"
-    run_root = (repository_root / ".fuse" / "runs" / run_id).resolve(strict=False)
+    root = repository_root.expanduser().resolve()
+    execution_id = uuid.uuid4().hex
+    relative = (
+        Path("artifacts") / "checks" / candidate_id / check_id / f"{execution_id}.log"
+    )
+    run_root = (root / ".fuse" / "runs" / run_id).resolve(strict=False)
     try:
-        run_root.relative_to(repository_root)
+        run_root.relative_to(root)
     except ValueError as error:
         raise CheckError(
             "run artifact directory resolves outside the repository"
         ) from error
     destination = run_root / relative
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(f".{destination.name}.tmp-{uuid.uuid4().hex}")
     try:
-        with temporary.open("xb") as stream:
+        destination.resolve(strict=False).relative_to(run_root)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise CheckError(
+            "artifact destination resolves outside the run directory"
+        ) from error
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        destination.resolve(strict=False).relative_to(run_root)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise CheckError(
+            "artifact destination resolves outside the run directory"
+        ) from error
+    created = False
+    try:
+        with destination.open("xb") as stream:
+            created = True
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, destination)
     except OSError:
-        temporary.unlink(missing_ok=True)
+        if created:
+            destination.unlink(missing_ok=True)
         raise
     return {
         "path": relative.as_posix(),
@@ -581,27 +610,120 @@ def _record_result(
     )
 
 
-def _has_required_output_artifact(evidence: Mapping[str, Any]) -> bool:
+def _required_output_artifacts(evidence: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     artifacts = evidence.get("artifacts", ())
-    return isinstance(artifacts, list) and any(
-        isinstance(artifact, Mapping) and artifact.get("required") is True
+    if not isinstance(artifacts, list):
+        return []
+    candidate_id = evidence.get("candidate_id")
+    check_id = evidence.get("check_id")
+    if not isinstance(candidate_id, str) or not isinstance(check_id, str):
+        return []
+    prefix = f"artifacts/checks/{candidate_id}/{check_id}/"
+    return [
+        artifact
         for artifact in artifacts
-    )
+        if isinstance(artifact, Mapping)
+        and artifact.get("required") is True
+        and isinstance(artifact.get("path"), str)
+        and artifact["path"].startswith(prefix)
+    ]
 
 
 def _has_check_provenance(evidence: Mapping[str, Any]) -> bool:
     source = evidence.get("source_provenance")
     tool_versions = evidence.get("tool_versions")
     return (
-        bool(evidence.get("config_digest"))
-        and bool(evidence.get("check_definition_digest"))
-        and isinstance(source, Mapping)
-        and isinstance(source.get("commit"), str)
-        and isinstance(source.get("pinned_worktree_commit"), str)
-        and isinstance(source.get("pinned_worktree_tree"), str)
+        isinstance(source, Mapping)
+        and _is_git_object_id(source.get("commit"))
+        and _is_git_object_id(source.get("pinned_worktree_commit"))
+        and _is_git_object_id(source.get("pinned_worktree_tree"))
+        and type(source.get("worktree_dirty")) is bool
         and isinstance(tool_versions, Mapping)
         and bool(tool_versions)
+        and all(
+            isinstance(name, str) and isinstance(version, str) and bool(version.strip())
+            for name, version in tool_versions.items()
+        )
     )
+
+
+def _candidate_matches_config(
+    candidate: Mapping[str, Any], config: Mapping[str, Any]
+) -> None:
+    try:
+        validate_config(config)
+    except ValueError as error:
+        raise CheckError(f"project configuration is invalid: {error}") from error
+    manifest = candidate.get("manifest")
+    verification = (
+        manifest.get("verification_inputs") if isinstance(manifest, Mapping) else None
+    )
+    if not isinstance(verification, Mapping):
+        raise CheckError("candidate configuration context is missing")
+    if verification.get("check_definitions") != config.get(
+        "checks"
+    ) or verification.get("toolchain") != config.get("toolchain"):
+        raise CheckError("candidate configuration context is stale")
+
+
+def _artifact_matches_provenance(
+    evidence: Mapping[str, Any], artifact_root: Path
+) -> bool:
+    output_artifacts = _required_output_artifacts(evidence)
+    if not output_artifacts:
+        return False
+    source = evidence.get("source_provenance")
+    if not isinstance(source, Mapping):
+        return False
+    artifact_root_resolved = artifact_root.expanduser().resolve()
+    for artifact in output_artifacts:
+        relative = Path(str(artifact["path"]))
+        if relative.is_absolute() or ".." in relative.parts:
+            continue
+        try:
+            artifact_path = (artifact_root_resolved / relative).resolve(strict=True)
+            artifact_path.relative_to(artifact_root_resolved)
+            lines = artifact_path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError, RuntimeError, ValueError):
+            continue
+        expected_headers = [
+            f"source_commit={source.get('commit')}",
+            f"pinned_commit={source.get('pinned_worktree_commit')}",
+            f"pinned_tree={source.get('pinned_worktree_tree')}",
+        ]
+        if len(lines) >= 4 and lines[1:4] == expected_headers:
+            return True
+    return False
+
+
+def _validate_check_evidence_context(
+    evidence: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    config: Mapping[str, Any],
+    check_id: str,
+    artifact_root: Path,
+) -> None:
+    _candidate_matches_config(candidate, config)
+    if check_id not in config["checks"]:
+        raise CheckError(f"unknown project check {check_id}")
+    expected_config_digest = _canonical_digest(config)
+    expected_check_digest = _canonical_digest(config["checks"][check_id])
+    if evidence.get("config_digest") != expected_config_digest:
+        raise CheckError(f"check {check_id} evidence configuration digest mismatch")
+    if evidence.get("check_definition_digest") != expected_check_digest:
+        raise CheckError(f"check {check_id} definition digest mismatch")
+    if evidence.get("candidate_id") != candidate.get("candidate_id"):
+        raise CheckError(f"check {check_id} evidence candidate mismatch")
+    if not _has_check_provenance(evidence):
+        raise CheckError(f"check {check_id} evidence provenance is invalid")
+    if not _required_output_artifacts(evidence):
+        raise CheckError(f"check {check_id} evidence has no required output artifact")
+    if not evidence_available(evidence, artifact_root):
+        raise CheckError(f"check {check_id} evidence has a missing required artifact")
+    if not _artifact_matches_provenance(evidence, artifact_root):
+        raise CheckError(
+            f"check {check_id} artifact provenance does not match evidence"
+        )
 
 
 def run_check(
@@ -643,6 +765,24 @@ def run_check(
         raise CheckError(f"candidate is stale: {error}") from error
     if current_manifest != candidate["manifest"]:
         raise CheckError(f"candidate is stale before check {check_id}")
+
+    readiness_record = dict(record)
+    readiness_record["evidence"] = [
+        evidence
+        for evidence in record["evidence"]
+        if not (
+            evidence["kind"] == "check"
+            and evidence.get("check_id") == check_id
+            and evidence.get("candidate_id") == candidate_id
+        )
+    ]
+    artifact_root = root / ".fuse" / "runs" / record["run_id"]
+    if check_id not in ready_check_ids(
+        config, [check_id], readiness_record, candidate_id, artifact_root
+    ):
+        raise CheckError(
+            f"check {check_id} is not ready because a prerequisite is not passing"
+        )
 
     check = config["checks"][check_id]
     command = list(check["command"])
@@ -809,6 +949,7 @@ def run_check(
         )
         output = (
             f"$ {' '.join(command)}\n"
+            f"source_commit={source['commit']}\n"
             f"pinned_commit={pinned_commit}\n"
             f"pinned_tree={pinned_tree}\n" + completed.stdout
         )
@@ -869,6 +1010,13 @@ def ready_check_ids(
 ) -> list[str]:
     """Return applicable checks with current candidate-matched prerequisites."""
     validate_run_record(record)
+    candidate = next(
+        (item for item in record["candidates"] if item["candidate_id"] == candidate_id),
+        None,
+    )
+    if candidate is None:
+        raise CheckError(f"candidate {candidate_id} is stale or missing")
+    _candidate_matches_config(candidate, config)
     checks = config["checks"]
     applicable_checks = list(applicable)
     graph = applicable_check_graph(checks, applicable_checks)
@@ -883,12 +1031,14 @@ def ready_check_ids(
         ):
             latest[str(evidence["check_id"])] = evidence
     for check_id, evidence in latest.items():
-        if (
-            evidence["outcome"] == "pass"
-            and _has_required_output_artifact(evidence)
-            and _has_check_provenance(evidence)
-            and evidence_available(evidence, artifact_root)
-        ):
+        try:
+            _validate_check_evidence_context(
+                evidence, candidate, config, check_id, artifact_root
+            )
+        except CheckError:
+            blocked.add(check_id)
+            continue
+        if evidence["outcome"] == "pass":
             completed.add(check_id)
         else:
             blocked.add(check_id)
@@ -905,6 +1055,7 @@ def require_check_evidence(
     check_id: str,
     candidate_id: str,
     artifact_root: Path,
+    config: Mapping[str, Any],
 ) -> Mapping[str, Any]:
     """Require the latest check result to pass for the exact candidate."""
     validate_run_record(record)
@@ -912,6 +1063,9 @@ def require_check_evidence(
     candidate_ids = {item["candidate_id"] for item in candidates}
     if candidate_id not in candidate_ids:
         raise CheckError(f"candidate {candidate_id} is stale or missing")
+    candidate = next(
+        item for item in candidates if item["candidate_id"] == candidate_id
+    )
     all_check_evidence = [
         evidence
         for evidence in record["evidence"]
@@ -931,10 +1085,7 @@ def require_check_evidence(
     evidence = matching[-1]
     if evidence["outcome"] != "pass":
         raise CheckError(f"check {check_id} evidence is not passing")
-    if not _has_required_output_artifact(evidence):
-        raise CheckError(f"check {check_id} evidence has no required output artifact")
-    if not evidence_available(evidence, artifact_root):
-        raise CheckError(f"check {check_id} evidence has a missing required artifact")
-    if not _has_check_provenance(evidence):
-        raise CheckError(f"check {check_id} evidence has incomplete provenance")
+    _validate_check_evidence_context(
+        evidence, candidate, config, check_id, artifact_root
+    )
     return cast(Mapping[str, Any], evidence)

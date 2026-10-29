@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib
 import subprocess
 import sys
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -88,6 +89,67 @@ def record_with_candidate(
     return record, candidate
 
 
+def append_check_evidence(
+    root: Path,
+    record: dict[str, Any],
+    candidate_id: str,
+    config: dict[str, Any],
+    *,
+    check_id: str,
+    outcome: str,
+    artifact_present: bool = True,
+    artifact_entry: bool = True,
+) -> dict[str, Any]:
+    source_commit = git(root, "rev-parse", "HEAD")
+    source = {
+        "commit": source_commit,
+        "branch": "main",
+        "worktree_dirty": False,
+        "pinned_worktree_commit": "1" * 40,
+        "pinned_worktree_tree": "2" * 40,
+    }
+    artifact_path = f"artifacts/checks/{candidate_id}/{check_id}/manual-output.log"
+    content = (
+        "$ manual check\n"
+        f"source_commit={source_commit}\n"
+        f"pinned_commit={source['pinned_worktree_commit']}\n"
+        f"pinned_tree={source['pinned_worktree_tree']}\n"
+        "manual output\n"
+    ).encode()
+    artifacts: list[dict[str, Any]] = []
+    if artifact_entry:
+        artifact_root = root / ".fuse" / "runs" / record["run_id"]
+        if artifact_present:
+            path = artifact_root / artifact_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        artifacts.append(
+            {
+                "path": artifact_path,
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "required": True,
+            }
+        )
+    return cast(
+        dict[str, Any],
+        fuse_record.add_evidence(
+            record,
+            candidate_id,
+            "check",
+            outcome,
+            "manual test evidence",
+            check_id=check_id,
+            artifacts=artifacts,
+            source_provenance=source,
+            tool_versions={"python": "3.11"},
+            config_digest=fuse_checks._canonical_digest(config),
+            check_definition_digest=fuse_checks._canonical_digest(
+                config["checks"][check_id]
+            ),
+        ),
+    )
+
+
 def test_run_check_records_candidate_bound_command_and_output_artifact(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -125,7 +187,7 @@ def test_run_check_records_candidate_bound_command_and_output_artifact(
     assert "check passed" in artifact.read_text(encoding="utf-8")
     assert (
         fuse_checks.require_check_evidence(
-            record, "tests", candidate["candidate_id"], artifact_root
+            record, "tests", candidate["candidate_id"], artifact_root, config
         )
         == evidence
     )
@@ -284,6 +346,172 @@ def test_deleted_tracked_file_is_a_pinned_candidate_input(
     assert result["outcome"] == "pass"
 
 
+@pytest.mark.parametrize(
+    "tampered_field",
+    ["config_digest", "check_definition_digest", "pinned_worktree_tree"],
+)
+def test_acceptance_rejects_fabricated_digests_and_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tampered_field: str,
+) -> None:
+    root, spec_dir, config, policy = check_project(tmp_path)
+    record, candidate = record_with_candidate(root, spec_dir, config, policy)
+    monkeypatch.setattr(
+        fuse_checks,
+        "prepare_toolchain",
+        lambda _root, _config: {
+            "ready": True,
+            "summary": "locked project environment ready",
+            "tool_versions": {"python": "3.11", "uv": "0.9"},
+        },
+    )
+    fuse_checks.run_check(
+        root, spec_dir, config, record, candidate["candidate_id"], "tests"
+    )
+    evidence = record["evidence"][-1]
+    if tampered_field == "pinned_worktree_tree":
+        evidence["source_provenance"][tampered_field] = "0" * 40
+    else:
+        evidence[tampered_field] = "0" * 64
+    artifact_root = root / ".fuse" / "runs" / record["run_id"]
+
+    with pytest.raises(
+        fuse_checks.CheckError,
+        match="digest|provenance|pinned worktree",
+    ):
+        fuse_checks.require_check_evidence(
+            record, "tests", candidate["candidate_id"], artifact_root, config
+        )
+    assert (
+        fuse_checks.ready_check_ids(
+            config, ["lint"], record, candidate["candidate_id"], artifact_root
+        )
+        == []
+    )
+
+
+def test_check_evidence_requires_config_to_match_candidate_manifest(
+    tmp_path: Path,
+) -> None:
+    root, spec_dir, config, policy = check_project(tmp_path)
+    record, candidate = record_with_candidate(root, spec_dir, config, policy)
+    config["checks"]["tests"]["command"] = [
+        sys.executable,
+        "-c",
+        "print('changed')",
+    ]
+    append_check_evidence(
+        root,
+        record,
+        candidate["candidate_id"],
+        config,
+        check_id="tests",
+        outcome="pass",
+    )
+    artifact_root = root / ".fuse" / "runs" / record["run_id"]
+
+    with pytest.raises(fuse_checks.CheckError, match="candidate configuration context"):
+        fuse_checks.require_check_evidence(
+            record, "tests", candidate["candidate_id"], artifact_root, config
+        )
+    with pytest.raises(fuse_checks.CheckError, match="candidate configuration context"):
+        fuse_checks.ready_check_ids(
+            config, ["lint"], record, candidate["candidate_id"], artifact_root
+        )
+
+
+def test_run_check_refuses_lint_until_current_tests_evidence_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, spec_dir, config, policy = check_project(tmp_path)
+    record, candidate = record_with_candidate(root, spec_dir, config, policy)
+    monkeypatch.setattr(
+        fuse_checks,
+        "prepare_toolchain",
+        lambda _root, _config: {
+            "ready": True,
+            "summary": "locked project environment ready",
+            "tool_versions": {"python": "3.11", "uv": "0.9"},
+        },
+    )
+
+    with pytest.raises(fuse_checks.CheckError, match="prerequisite"):
+        fuse_checks.run_check(
+            root, spec_dir, config, record, candidate["candidate_id"], "lint"
+        )
+    assert record["evidence"] == []
+
+    tests = fuse_checks.run_check(
+        root, spec_dir, config, record, candidate["candidate_id"], "tests"
+    )
+    assert tests["outcome"] == "pass"
+    lint = fuse_checks.run_check(
+        root, spec_dir, config, record, candidate["candidate_id"], "lint"
+    )
+    assert lint["outcome"] == "pass"
+
+
+def test_each_check_execution_keeps_its_own_output_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, spec_dir, config, policy = check_project(tmp_path)
+    counter = tmp_path / "run-counter.txt"
+    config["checks"]["tests"]["command"] = [
+        sys.executable,
+        "-c",
+        "from pathlib import Path; "
+        f"p = Path({str(counter)!r}); "
+        "n = int(p.read_text()) if p.exists() else 0; "
+        "p.write_text(str(n + 1)); print(f'run={n + 1}')",
+    ]
+    record, candidate = record_with_candidate(root, spec_dir, config, policy)
+    monkeypatch.setattr(
+        fuse_checks,
+        "prepare_toolchain",
+        lambda _root, _config: {
+            "ready": True,
+            "summary": "locked project environment ready",
+            "tool_versions": {"python": "3.11", "uv": "0.9"},
+        },
+    )
+
+    first = fuse_checks.run_check(
+        root, spec_dir, config, record, candidate["candidate_id"], "tests"
+    )
+    second = fuse_checks.run_check(
+        root, spec_dir, config, record, candidate["candidate_id"], "tests"
+    )
+    artifact_root = root / ".fuse" / "runs" / record["run_id"]
+    first_evidence, second_evidence = record["evidence"]
+    first_path = first_evidence["artifacts"][0]["path"]
+    second_path = second_evidence["artifacts"][0]["path"]
+
+    assert first["outcome"] == second["outcome"] == "pass"
+    assert first_path != second_path
+    assert fuse_record.evidence_available(first_evidence, artifact_root)
+    assert fuse_record.evidence_available(second_evidence, artifact_root)
+    assert "run=1" in (artifact_root / first_path).read_text(encoding="utf-8")
+    assert "run=2" in (artifact_root / second_path).read_text(encoding="utf-8")
+
+
+def test_output_artifact_rejects_parent_symlink_escape(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    run_id = "run_0123456789abcdef0123456789abcdef"
+    run_root = root / ".fuse" / "runs" / run_id
+    run_root.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (run_root / "artifacts").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(fuse_checks.CheckError, match="outside the run directory"):
+        fuse_checks._write_output_artifact(
+            root, run_id, "a" * 64, "tests", b"must not escape"
+        )
+    assert list(outside.iterdir()) == []
+
+
 def test_check_runner_rejects_stale_candidate_before_execution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -358,12 +586,12 @@ def test_failed_check_and_mismatched_evidence_cannot_satisfy_acceptance(
     assert result["outcome"] == "fail"
     with pytest.raises(fuse_checks.CheckError, match="not passing"):
         fuse_checks.require_check_evidence(
-            record, "tests", candidate["candidate_id"], artifact_root
+            record, "tests", candidate["candidate_id"], artifact_root, config
         )
     another_candidate = fuse_record.add_candidate(record, {"source": "different"})
     with pytest.raises(fuse_checks.CheckError, match="stale candidate"):
         fuse_checks.require_check_evidence(
-            record, "tests", another_candidate["candidate_id"], artifact_root
+            record, "tests", another_candidate["candidate_id"], artifact_root, config
         )
 
 
@@ -372,19 +600,20 @@ def test_pass_without_required_output_artifact_cannot_satisfy_check(
 ) -> None:
     root, spec_dir, config, policy = check_project(tmp_path)
     record, candidate = record_with_candidate(root, spec_dir, config, policy)
-    fuse_record.add_evidence(
+    append_check_evidence(
+        root,
         record,
         candidate["candidate_id"],
-        "check",
-        "pass",
-        "reported pass",
+        config,
         check_id="tests",
+        outcome="pass",
+        artifact_entry=False,
     )
     artifact_root = root / ".fuse" / "runs" / record["run_id"]
 
     with pytest.raises(fuse_checks.CheckError, match="required output artifact"):
         fuse_checks.require_check_evidence(
-            record, "tests", candidate["candidate_id"], artifact_root
+            record, "tests", candidate["candidate_id"], artifact_root, config
         )
     assert (
         fuse_checks.ready_check_ids(
@@ -399,20 +628,20 @@ def test_missing_artifact_makes_passing_evidence_unavailable(
 ) -> None:
     root, spec_dir, config, policy = check_project(tmp_path)
     record, candidate = record_with_candidate(root, spec_dir, config, policy)
-    fuse_record.add_evidence(
+    append_check_evidence(
+        root,
         record,
         candidate["candidate_id"],
-        "check",
-        "pass",
-        "reported pass",
+        config,
         check_id="tests",
-        artifacts=[{"path": "missing.log", "sha256": "0" * 64, "required": True}],
+        outcome="pass",
+        artifact_present=False,
     )
     artifact_root = root / ".fuse" / "runs" / record["run_id"]
 
     with pytest.raises(fuse_checks.CheckError, match="required artifact"):
         fuse_checks.require_check_evidence(
-            record, "tests", candidate["candidate_id"], artifact_root
+            record, "tests", candidate["candidate_id"], artifact_root, config
         )
     assert fuse_checks.ready_check_ids(
         config, ["lint", "docs"], record, candidate["candidate_id"], artifact_root
@@ -424,17 +653,21 @@ def test_failed_prerequisite_blocks_only_dependent_checks(
 ) -> None:
     root, spec_dir, config, policy = check_project(tmp_path)
     record, candidate = record_with_candidate(root, spec_dir, config, policy)
-    fuse_record.add_evidence(
+    append_check_evidence(
+        root,
         record,
         candidate["candidate_id"],
-        "check",
-        "fail",
-        "tests failed",
+        config,
         check_id="tests",
+        outcome="fail",
     )
 
     assert fuse_checks.ready_check_ids(
-        config, ["lint", "docs"], record, candidate["candidate_id"], root
+        config,
+        ["lint", "docs"],
+        record,
+        candidate["candidate_id"],
+        root / ".fuse" / "runs" / record["run_id"],
     ) == ["docs"]
 
 
