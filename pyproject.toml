@@ -34,6 +34,7 @@ indent-style = "space"
 python_version = "3.11"
 strict = true
 files = [
+    "skills/scripts/next_spec_number.py",
     "skills/scripts/plan_waves.py",
     "skills/scripts/sync_check.py",
     "tests",
