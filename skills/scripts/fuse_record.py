@@ -188,6 +188,7 @@ def _semantic_errors(record: Mapping[str, Any]) -> list[str]:
         latest_action = finding["history"][-1]["action"]
         expected_status = {
             "opened": "open",
+            "confirmed": "open",
             "reopened": "open",
             "resolved": "resolved",
             "dismissed": "dismissed",
@@ -332,6 +333,8 @@ def _validate_history(previous: Mapping[str, Any], current: Mapping[str, Any]) -
     for old_finding, new_finding in zip(old_findings, new_findings):
         if old_finding["task_id"] != new_finding["task_id"]:
             raise RecordError("finding task identity is immutable")
+        if old_finding["scope"] != new_finding["scope"]:
+            raise RecordError("finding scope identity is immutable")
         old_history = old_finding["history"]
         new_history = new_finding["history"]
         if new_history[: len(old_history)] != old_history:
@@ -734,6 +737,87 @@ def add_finding(
         "created_at": now,
     }
     record["findings"].append(finding)
+    validate_run_record(record)
+    return cast(dict[str, Any], finding)
+
+
+def append_finding_evidence(
+    record: dict[str, Any], finding_id: str, evidence_id: str, rationale: str
+) -> dict[str, Any]:
+    """Link repeat evidence to a stable finding and reopen it when needed."""
+    finding = next(
+        (item for item in record["findings"] if item["id"] == finding_id), None
+    )
+    if finding is None:
+        raise RecordError(f"unknown finding {finding_id}")
+    evidence = next(
+        (item for item in record["evidence"] if item["id"] == evidence_id), None
+    )
+    if evidence is None:
+        raise RecordError(f"unknown evidence {evidence_id}")
+    if not rationale.strip():
+        raise RecordError("finding evidence rationale must not be empty")
+    if evidence_id in finding["evidence_ids"]:
+        return cast(dict[str, Any], finding)
+    action = "confirmed" if finding["status"] in {"open", "deferred"} else "reopened"
+    finding["status"] = "open"
+    if evidence_id not in finding["evidence_ids"]:
+        finding["evidence_ids"].append(evidence_id)
+    finding["history"].append(
+        {
+            "at": _now(),
+            "action": action,
+            "rationale": rationale.strip(),
+            "evidence_ids": [evidence_id],
+        }
+    )
+    validate_run_record(record)
+    return cast(dict[str, Any], finding)
+
+
+def resolve_check_finding(
+    record: dict[str, Any],
+    finding_id: str,
+    task_id: str,
+    check_id: str,
+    candidate_id: str,
+    evidence_id: str,
+) -> dict[str, Any]:
+    """Resolve a check-scoped finding only with matching passing check evidence."""
+    finding = next(
+        (item for item in record["findings"] if item["id"] == finding_id), None
+    )
+    if finding is None:
+        raise RecordError(f"unknown finding {finding_id}")
+    if (
+        finding["task_id"] != task_id
+        or finding["scope"] != f"check:{check_id}"
+        or not finding["blocking"]
+        or finding["status"] not in {"open", "deferred"}
+    ):
+        raise RecordError("check resolution does not match an open task finding")
+    evidence = next(
+        (item for item in record["evidence"] if item["id"] == evidence_id), None
+    )
+    if (
+        evidence is None
+        or evidence["kind"] != "check"
+        or evidence.get("check_id") != check_id
+        or evidence["outcome"] != "pass"
+        or evidence["candidate_id"] != candidate_id
+    ):
+        raise RecordError("check finding resolution requires matching passing evidence")
+    finding["status"] = "resolved"
+    if evidence_id not in finding["evidence_ids"]:
+        finding["evidence_ids"].append(evidence_id)
+    finding["history"].append(
+        {
+            "at": _now(),
+            "action": "resolved",
+            "rationale": f"Check {check_id} passed for the current candidate",
+            "evidence_ids": [evidence_id],
+        }
+    )
     validate_run_record(record)
     return cast(dict[str, Any], finding)
 

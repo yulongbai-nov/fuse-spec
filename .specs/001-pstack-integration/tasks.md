@@ -46,6 +46,7 @@
     - Require explicit absolute `--repo-root` and `--spec-dir` arguments at the CLI boundary. Run Git and project check subprocesses with the consuming repository root as their working directory, regardless of the Fuse plugin's launcher directory.
     - Implement a standard-library launcher that captures its starting directory, resolves the target root and spec path before invoking uv, and passes the absolute paths through to the CLI after uv changes to the plugin root.
     - Keep one transition validator as the shared owner used by the CLI and `/reconcile-spec`. Reject invalid state with machine-readable reasons; do not treat agent claims or task checkboxes as proof.
+    - Bind failed executable checks to the affected task as stable blocking findings, allow only budgeted in-scope repairs, and resolve only with matching passing check evidence for the current candidate.
     - Continue unrelated eligible work when a task/check is blocked. Stop only when no authorized action remains or a configured limit is reached, and preserve a resumable checkpoint.
     - Invoke executable checks directly and summarize verified output for agents; do not spend model calls re-interpreting successful mechanical checks.
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import unicodedata
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -318,6 +319,11 @@ def _dependencies_accepted(
     return True
 
 
+def _normalized_finding_text(summary: str) -> str:
+    """Normalize only Unicode, case, and whitespace for deterministic identity."""
+    return " ".join(unicodedata.normalize("NFKC", summary).casefold().split())
+
+
 def _snapshot(
     record: Mapping[str, Any], root: Path, spec: Path, config: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -567,9 +573,11 @@ def validate_transition(
     finding_id: str | None = None,
     review_outcome: str | None = None,
     finding_summaries: Sequence[str] = (),
+    repeat_finding_ids: Sequence[str] = (),
     resolve_finding_ids: Sequence[str] = (),
     resolution_rationale: str | None = None,
     check_id: str | None = None,
+    evidence_id: str | None = None,
 ) -> TransitionDecision:
     """Validate every managed state transition for CLI and reconcile callers."""
     try:
@@ -605,7 +613,13 @@ def validate_transition(
             return _deny("run_not_running", f"run status {status} cannot be paused")
         return _allow(status="paused")
 
-    if operation in {"prepare-dispatch", "run-check", "record-review", "accept"}:
+    if operation in {
+        "prepare-dispatch",
+        "run-check",
+        "record-check-outcome",
+        "record-review",
+        "accept",
+    }:
         if status != "running":
             return _deny(
                 "run_not_running", f"run status {status} does not allow {operation}"
@@ -878,7 +892,9 @@ def validate_transition(
             candidate_id=pinned_candidate,
         )
 
-    if operation == "run-check":
+    if operation in {"run-check", "record-check-outcome"}:
+        if task_id is None or task_id not in graph:
+            return _deny("unknown_task", f"task {task_id!r} is not declared")
         if check_id is None or check_id not in config.get("checks", {}):
             return _deny("unknown_check", f"check {check_id!r} is not configured")
         try:
@@ -895,7 +911,32 @@ def validate_transition(
                 "requested candidate is not current",
                 current_candidate_id=current_id,
             )
-        return _allow(check_id=check_id, candidate_id=current_id)
+        if operation == "run-check":
+            return _allow(task_id=task_id, check_id=check_id, candidate_id=current_id)
+        evidence = next(
+            (item for item in current["evidence"] if item["id"] == evidence_id),
+            None,
+        )
+        if (
+            evidence is None
+            or evidence["kind"] != "check"
+            or evidence.get("check_id") != check_id
+            or evidence.get("outcome") not in {"pass", "fail"}
+            or evidence.get("candidate_id") != current_id
+        ):
+            return _deny(
+                "check_evidence_invalid",
+                "check finding updates require current passing or failed evidence",
+                check_id=check_id,
+                candidate_id=current_id,
+            )
+        return _allow(
+            task_id=task_id,
+            check_id=check_id,
+            candidate_id=current_id,
+            evidence_id=evidence_id,
+            outcome=evidence["outcome"],
+        )
 
     if operation == "record-review":
         if task_id is None or task_id not in graph:
@@ -954,6 +995,18 @@ def validate_transition(
                 "review report must match the current candidate",
                 current_candidate_id=current_id,
             )
+        if any(
+            item["kind"] == "review"
+            and item.get("assignment_id") == assignment_id
+            and item["candidate_id"] == current_id
+            for item in current["evidence"]
+        ):
+            return _deny(
+                "review_already_recorded",
+                "this reviewer assignment already has evidence for the candidate",
+                assignment_id=assignment_id,
+                candidate_id=current_id,
+            )
         if review_outcome not in {"pass", "fail"}:
             return _deny(
                 "review_outcome_required", "review outcome must be pass or fail"
@@ -972,6 +1025,74 @@ def validate_transition(
             return _deny(
                 "passing_review_findings_invalid",
                 "passing reviews cannot add findings; use a failed review",
+            )
+        if repeat_finding_ids and review_outcome != "fail":
+            return _deny(
+                "repeat_finding_not_allowed",
+                "repeat finding IDs are valid only for failed reviews",
+            )
+        if repeat_finding_ids and len(repeat_finding_ids) != len(normalized_findings):
+            return _deny(
+                "repeat_finding_ids_invalid",
+                "provide one existing finding ID for each reported finding",
+            )
+        if len(repeat_finding_ids) != len(set(repeat_finding_ids)):
+            return _deny(
+                "duplicate_repeat_finding_id",
+                "a finding may be repeated only once per review",
+            )
+        finding_targets: list[str | None] = []
+        finding_scopes: list[str] = []
+        identity_keys: list[str] = []
+        for index, finding_summary in enumerate(normalized_findings):
+            if repeat_finding_ids:
+                repeat_id = repeat_finding_ids[index]
+                existing = next(
+                    (
+                        item
+                        for item in current["findings"]
+                        if item["id"] == repeat_id
+                        and item["task_id"] == task_id
+                        and item["blocking"]
+                    ),
+                    None,
+                )
+                if existing is None:
+                    return _deny(
+                        "repeat_finding_invalid",
+                        "repeat finding ID must identify an existing blocking "
+                        "finding on this task",
+                        finding_id=repeat_id,
+                    )
+                finding_targets.append(repeat_id)
+                finding_scopes.append(str(existing["scope"]))
+                identity_keys.append(f"finding:{repeat_id}")
+                continue
+            normalized_summary = _normalized_finding_text(finding_summary)
+            matches = [
+                item
+                for item in current["findings"]
+                if item["task_id"] == task_id
+                and item["blocking"]
+                and _normalized_finding_text(item["summary"]) == normalized_summary
+            ]
+            if len(matches) > 1:
+                return _deny(
+                    "finding_match_ambiguous",
+                    "more than one existing finding matches this normalized report",
+                    task_id=task_id,
+                )
+            finding_targets.append(matches[0]["id"] if matches else None)
+            finding_scopes.append(str(matches[0]["scope"]) if matches else task_id)
+            identity_keys.append(
+                f"finding:{matches[0]['id']}"
+                if matches
+                else f"summary:{normalized_summary}"
+            )
+        if len(identity_keys) != len(set(identity_keys)):
+            return _deny(
+                "duplicate_review_findings",
+                "a review cannot report the same finding identity more than once",
             )
         if len(resolve_finding_ids) != len(set(resolve_finding_ids)):
             return _deny(
@@ -1017,6 +1138,8 @@ def validate_transition(
             candidate_id=current_id,
             outcome=review_outcome,
             finding_summaries=normalized_findings,
+            finding_targets=finding_targets,
+            finding_scopes=finding_scopes,
             resolve_finding_ids=list(resolve_finding_ids),
             resolution_rationale=(
                 resolution_rationale.strip() if resolution_rationale else None
@@ -1084,6 +1207,7 @@ def record_review_evidence(
     report: bytes,
     *,
     finding_summaries: Sequence[str] = (),
+    repeat_finding_ids: Sequence[str] = (),
     resolve_finding_ids: Sequence[str] = (),
     resolution_rationale: str | None = None,
 ) -> dict[str, Any]:
@@ -1103,6 +1227,7 @@ def record_review_evidence(
         candidate_id=candidate_id,
         review_outcome=outcome,
         finding_summaries=finding_summaries,
+        repeat_finding_ids=repeat_finding_ids,
         resolve_finding_ids=resolve_finding_ids,
         resolution_rationale=resolution_rationale,
     )
@@ -1135,13 +1260,27 @@ def record_review_evidence(
             tool_versions={},
         )
         if outcome == "fail":
-            for finding_summary in decision.details["finding_summaries"]:
-                fuse_record.add_finding(
-                    record,
-                    task_id,
-                    finding_summary,
-                    evidence_ids=[evidence["id"]],
-                )
+            for finding_summary, finding_id, finding_scope in zip(
+                decision.details["finding_summaries"],
+                decision.details["finding_targets"],
+                decision.details["finding_scopes"],
+                strict=True,
+            ):
+                if finding_id is None:
+                    fuse_record.add_finding(
+                        record,
+                        task_id,
+                        finding_summary,
+                        scope=finding_scope,
+                        evidence_ids=[evidence["id"]],
+                    )
+                else:
+                    fuse_record.append_finding_evidence(
+                        record,
+                        finding_id,
+                        evidence["id"],
+                        f"Reviewer reconfirmed finding: {finding_summary}",
+                    )
         else:
             for finding_id in decision.details["resolve_finding_ids"]:
                 fuse_record.resolve_finding(
@@ -1154,6 +1293,79 @@ def record_review_evidence(
         return evidence
     except fuse_record.RecordError as error:
         raise ControlError("run_record_invalid", str(error)) from error
+
+
+def record_check_outcome(
+    record: dict[str, Any],
+    repository_root: Path,
+    spec_dir: Path,
+    config: Mapping[str, Any],
+    task_id: str,
+    check_id: str,
+    candidate_id: str,
+    evidence_id: str,
+) -> dict[str, Any] | None:
+    """Link a failed check to a task finding or resolve it on a matching pass."""
+    decision = validate_transition(
+        "record-check-outcome",
+        repository_root=repository_root,
+        spec_dir=spec_dir,
+        config=config,
+        record=record,
+        task_id=task_id,
+        check_id=check_id,
+        candidate_id=candidate_id,
+        evidence_id=evidence_id,
+    )
+    if not decision.allowed:
+        raise ControlError(decision.reason, decision.message, decision.details)
+    evidence = next(item for item in record["evidence"] if item["id"] == evidence_id)
+    scope = f"check:{check_id}"
+    finding = next(
+        (
+            item
+            for item in record["findings"]
+            if item["task_id"] == task_id and item["scope"] == scope
+        ),
+        None,
+    )
+    if evidence["outcome"] == "fail":
+        record["tasks"].setdefault(
+            task_id,
+            {"status": "pending", "assignment_ids": [], "accepted_candidate_id": None},
+        )
+        rationale = f"Check {check_id} failed: {evidence['summary']}"
+        if finding is None:
+            finding = fuse_record.add_finding(
+                record,
+                task_id,
+                rationale,
+                scope=scope,
+                evidence_ids=[evidence_id],
+            )
+        else:
+            finding = fuse_record.append_finding_evidence(
+                record, finding["id"], evidence_id, rationale
+            )
+        return finding
+    if (
+        finding is not None
+        and finding["blocking"]
+        and finding["status"]
+        in {
+            "open",
+            "deferred",
+        }
+    ):
+        return fuse_record.resolve_check_finding(
+            record,
+            finding["id"],
+            task_id,
+            check_id,
+            candidate_id,
+            evidence_id,
+        )
+    return finding
 
 
 def set_run_status(

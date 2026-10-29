@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -840,15 +841,33 @@ def run_check(
         raise CheckError(f"candidate is stale before check {check_id}")
 
     readiness_record = dict(record)
-    readiness_record["evidence"] = [
-        evidence
+    prior_check_evidence_ids = {
+        evidence["id"]
         for evidence in record["evidence"]
-        if not (
+        if (
             evidence["kind"] == "check"
             and evidence.get("check_id") == check_id
             and evidence.get("candidate_id") == candidate_id
         )
+    }
+    readiness_record["evidence"] = [
+        evidence
+        for evidence in record["evidence"]
+        if evidence["id"] not in prior_check_evidence_ids
     ]
+    readiness_record["findings"] = copy.deepcopy(record["findings"])
+    for finding in readiness_record["findings"]:
+        finding["evidence_ids"] = [
+            evidence_id
+            for evidence_id in finding["evidence_ids"]
+            if evidence_id not in prior_check_evidence_ids
+        ]
+        for entry in finding["history"]:
+            entry["evidence_ids"] = [
+                evidence_id
+                for evidence_id in entry["evidence_ids"]
+                if evidence_id not in prior_check_evidence_ids
+            ]
     artifact_root = root / ".fuse" / "runs" / record["run_id"]
     if check_id not in ready_check_ids(
         config, [check_id], readiness_record, candidate_id, artifact_root

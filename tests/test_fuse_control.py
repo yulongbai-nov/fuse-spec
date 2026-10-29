@@ -202,6 +202,47 @@ def fail_review_with_finding(
     return candidate_id, str(payload(failed)["evidence_id"])
 
 
+def submit_review(
+    root: Path,
+    spec_dir: Path,
+    run_id: str,
+    assignment_id: str,
+    candidate_id: str,
+    report: Path,
+    *,
+    outcome: str,
+    summary: str,
+    findings: tuple[str, ...] = (),
+    repeat_finding_ids: tuple[str, ...] = (),
+    resolve_finding_ids: tuple[str, ...] = (),
+    resolution_rationale: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    arguments = [
+        "--run-id",
+        run_id,
+        "--task-id",
+        "T1",
+        "--assignment-id",
+        assignment_id,
+        "--candidate-id",
+        candidate_id,
+        "--outcome",
+        outcome,
+        "--summary",
+        summary,
+    ]
+    for finding in findings:
+        arguments.extend(("--finding", finding))
+    for finding_id in repeat_finding_ids:
+        arguments.extend(("--repeat-finding-id", finding_id))
+    for finding_id in resolve_finding_ids:
+        arguments.extend(("--resolve-finding-id", finding_id))
+    if resolution_rationale is not None:
+        arguments.extend(("--resolution-rationale", resolution_rationale))
+    arguments.extend(("--report", str(report)))
+    return run_cli(root, spec_dir, "record-review", *arguments)
+
+
 def test_cli_requires_absolute_roots_and_returns_machine_reason(tmp_path: Path) -> None:
     root, spec_dir = make_project(tmp_path)
     result = subprocess.run(
@@ -537,6 +578,8 @@ def test_acceptance_succeeds_with_current_check_and_independent_review(
             str(spec_dir),
             "--run-id",
             run_id,
+            "--task-id",
+            "T1",
             "--check-id",
             "smoke",
             "--candidate-id",
@@ -1280,3 +1323,461 @@ def test_approved_t7_t8_write_scopes_cannot_be_reserved_together(
     )
     assert t8.returncode != 0
     assert payload(t8)["reason"] == "write_scope_conflict"
+
+
+def test_failed_check_retries_reuse_task_finding_and_rca_allowance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root, spec_dir = make_project(tmp_path)
+    config_path = root / ".fuse" / "config.toml"
+    original = config_path.read_text(encoding="utf-8")
+    config_path.write_text(
+        original.split("[checks.pytest]", maxsplit=1)[0]
+        + "[checks.smoke]\n"
+        + """command = ["sh", "-c", "grep -q 'value = 2' app.py"]\n"""
+        + "prerequisites = []\n"
+        + 'inputs = ["app.py"]\n'
+        + 'pass_criteria = "exit_code == 0"\n',
+        encoding="utf-8",
+    )
+    git(root, "add", ".fuse/config.toml")
+    git(root, "commit", "--quiet", "-m", "configure failing smoke check")
+    run_id = initialized_run(root, spec_dir)
+    finish_assignment(root, spec_dir, run_id, "T1", "Feature", "worker", "worker-1")
+    record = fuse_state.load_run(root, run_id)
+    config = fuse_config.load_config(config_path)
+    candidate = fuse_control.current_candidate(record, root, spec_dir, config)
+    fuse_state.save_run(root, record)
+    preparation_state = {"mode": "ready"}
+
+    def prepare_toolchain(check_root: Path, *_args: Any) -> dict[str, Any]:
+        if preparation_state["mode"] == "unavailable":
+            return {
+                "ready": False,
+                "summary": "test selected toolchain is unavailable",
+                "tool_versions": {},
+            }
+        if preparation_state["mode"] == "inconclusive":
+            (check_root / "app.py").write_text(
+                "value = 'changed during preparation'\n", encoding="utf-8"
+            )
+        return {
+            "ready": True,
+            "summary": "test selected toolchain is available",
+            "tool_versions": {"python": "3.11"},
+        }
+
+    monkeypatch.setattr(fuse_checks, "prepare_toolchain", prepare_toolchain)
+
+    def run_check(candidate_id: str) -> dict[str, Any]:
+        status = fuse_cli.main(
+            [
+                "run-check",
+                "--repo-root",
+                str(root),
+                "--spec-dir",
+                str(spec_dir),
+                "--run-id",
+                run_id,
+                "--task-id",
+                "T1",
+                "--check-id",
+                "smoke",
+                "--candidate-id",
+                candidate_id,
+            ]
+        )
+        assert status == 0
+        return payload(subprocess.CompletedProcess([], 0, capsys.readouterr().out, ""))
+
+    preparation_state["mode"] = "unavailable"
+    unavailable_result = run_check(candidate["candidate_id"])
+    assert unavailable_result["outcome"] == "unavailable"
+    record = fuse_state.load_run(root, run_id)
+    assert record["evidence"][-1]["outcome"] == "unavailable"
+    assert record["findings"] == []
+
+    preparation_state["mode"] = "inconclusive"
+    inconclusive_result = run_check(candidate["candidate_id"])
+    assert inconclusive_result["outcome"] == "inconclusive"
+    record = fuse_state.load_run(root, run_id)
+    assert record["evidence"][-1]["outcome"] == "inconclusive"
+    assert record["findings"] == []
+
+    preparation_state["mode"] = "ready"
+    first_result = run_check(candidate["candidate_id"])
+    assert first_result["outcome"] == "fail"
+    record = fuse_state.load_run(root, run_id)
+    assert len(record["findings"]) == 1
+    finding = record["findings"][0]
+    finding_id = finding["id"]
+    first_evidence_id = first_result["evidence_id"]
+    assert finding["scope"] == "check:smoke"
+    assert finding["task_id"] == "T1"
+    assert finding["evidence_ids"] == [first_evidence_id]
+
+    repair = run_cli(
+        root,
+        spec_dir,
+        "prepare-dispatch",
+        "--run-id",
+        run_id,
+        "--task-id",
+        "T1",
+        "--method",
+        "Bug Fix",
+        "--role-profile",
+        "worker",
+    )
+    assert repair.returncode == 0, repair.stdout
+    repair_data = payload(repair)
+    assert (
+        run_cli(
+            root,
+            spec_dir,
+            "bind-launch",
+            "--run-id",
+            run_id,
+            "--assignment-id",
+            repair_data["assignment_id"],
+            "--attempt-id",
+            repair_data["attempt_id"],
+            "--host-handle",
+            "check-repair-1",
+        ).returncode
+        == 0
+    )
+    assert (
+        run_cli(
+            root,
+            spec_dir,
+            "record-result",
+            "--run-id",
+            run_id,
+            "--assignment-id",
+            repair_data["assignment_id"],
+            "--attempt-id",
+            repair_data["attempt_id"],
+            "--outcome",
+            "succeeded",
+        ).returncode
+        == 0
+    )
+    record = fuse_state.load_run(root, run_id)
+    assert record["review_counters"] == [
+        {"scope_id": "T1", "level": "task", "repairs_used": 1, "limit": 2}
+    ]
+
+    rca = run_cli(
+        root,
+        spec_dir,
+        "prepare-dispatch",
+        "--run-id",
+        run_id,
+        "--task-id",
+        "T1",
+        "--method",
+        "Bug Fix",
+        "--role-profile",
+        "rca",
+        "--finding-id",
+        finding_id,
+    )
+    assert rca.returncode == 0, rca.stdout
+    rca_data = payload(rca)
+    assert (
+        run_cli(
+            root,
+            spec_dir,
+            "bind-launch",
+            "--run-id",
+            run_id,
+            "--assignment-id",
+            rca_data["assignment_id"],
+            "--attempt-id",
+            rca_data["attempt_id"],
+            "--host-handle",
+            "rca-check-1",
+        ).returncode
+        == 0
+    )
+    assert (
+        run_cli(
+            root,
+            spec_dir,
+            "record-result",
+            "--run-id",
+            run_id,
+            "--assignment-id",
+            rca_data["assignment_id"],
+            "--attempt-id",
+            rca_data["attempt_id"],
+            "--outcome",
+            "succeeded",
+        ).returncode
+        == 0
+    )
+    record_after_rca = fuse_state.load_run(root, run_id)
+    assert first_evidence_id in {
+        evidence["id"] for evidence in record_after_rca["evidence"]
+    }
+    assert first_evidence_id in record_after_rca["findings"][0]["evidence_ids"]
+
+    second_result = run_check(candidate["candidate_id"])
+    assert second_result["outcome"] == "fail"
+    record = fuse_state.load_run(root, run_id)
+    assert len(record["findings"]) == 1
+    finding = record["findings"][0]
+    assert finding["id"] == finding_id
+    assert finding["evidence_ids"] == [first_evidence_id, second_result["evidence_id"]]
+    assert len(finding["history"]) == 2
+    assert finding["history"][-1]["action"] == "confirmed"
+    assert record["rca_attempts"] == [
+        {"finding_id": finding_id, "attempts_used": 1, "limit": 1}
+    ]
+    exhausted = run_cli(
+        root,
+        spec_dir,
+        "prepare-dispatch",
+        "--run-id",
+        run_id,
+        "--task-id",
+        "T1",
+        "--method",
+        "Bug Fix",
+        "--role-profile",
+        "rca",
+        "--finding-id",
+        finding_id,
+    )
+    assert exhausted.returncode != 0
+    assert payload(exhausted)["reason"] == "rca_limit_exhausted"
+
+    record = fuse_state.load_run(root, run_id)
+    review_finding = fuse_record.add_finding(
+        record, "T1", "Independent review issue", scope="review:independent"
+    )
+    fuse_state.save_run(root, record)
+    (root / "app.py").write_text("value = 2\n", encoding="utf-8")
+    record = fuse_state.load_run(root, run_id)
+    candidate = fuse_control.current_candidate(record, root, spec_dir, config)
+    fuse_state.save_run(root, record)
+    passing_result = run_check(candidate["candidate_id"])
+    assert passing_result["outcome"] == "pass"
+    record = fuse_state.load_run(root, run_id)
+    check_finding = next(
+        item for item in record["findings"] if item["id"] == finding_id
+    )
+    assert check_finding["status"] == "resolved"
+    assert check_finding["history"][-1]["action"] == "resolved"
+    assert check_finding["history"][-1]["evidence_ids"] == [
+        passing_result["evidence_id"]
+    ]
+    assert (
+        next(item for item in record["findings"] if item["id"] == review_finding["id"])[
+            "status"
+        ]
+        == "open"
+    )
+
+
+def test_review_replay_is_rejected_and_reopened_normalized_finding_keeps_id(
+    tmp_path: Path,
+) -> None:
+    root, spec_dir = make_project(tmp_path)
+    run_id = initialized_run(root, spec_dir)
+    candidate_id, first_evidence_id = fail_review_with_finding(
+        root, spec_dir, run_id, tmp_path
+    )
+    record = fuse_state.load_run(root, run_id)
+    finding_id = record["findings"][0]["id"]
+    first_reviewer = next(
+        item for item in record["assignments"] if item["role_profile"] == "reviewer"
+    )
+
+    replay_report = tmp_path / "review-replay.md"
+    replay_report.write_text("Replay report\n", encoding="utf-8")
+    replay = submit_review(
+        root,
+        spec_dir,
+        run_id,
+        first_reviewer["id"],
+        candidate_id,
+        replay_report,
+        outcome="fail",
+        summary="Replay of the same review",
+        findings=("Correct the blocking behavior.",),
+    )
+    assert replay.returncode != 0
+    assert payload(replay)["reason"] == "review_already_recorded"
+    assert len(fuse_state.load_run(root, run_id)["evidence"]) == 1
+
+    invalid_repeat_assignment = finish_assignment(
+        root,
+        spec_dir,
+        run_id,
+        "T1",
+        "Review",
+        "reviewer",
+        "reviewer-invalid-repeat-id",
+    )
+    invalid_repeat_report = tmp_path / "review-invalid-repeat.md"
+    invalid_repeat_report.write_text("A rephrased blocker report.\n", encoding="utf-8")
+    invalid_repeat = submit_review(
+        root,
+        spec_dir,
+        run_id,
+        invalid_repeat_assignment["assignment_id"],
+        candidate_id,
+        invalid_repeat_report,
+        outcome="fail",
+        summary="A rephrased blocker report.",
+        findings=("The behavior still violates the original requirement.",),
+        repeat_finding_ids=("fnd_" + "0" * 32,),
+    )
+    assert invalid_repeat.returncode != 0
+    assert payload(invalid_repeat)["reason"] == "repeat_finding_invalid"
+    assert len(fuse_state.load_run(root, run_id)["findings"]) == 1
+
+    rca = run_cli(
+        root,
+        spec_dir,
+        "prepare-dispatch",
+        "--run-id",
+        run_id,
+        "--task-id",
+        "T1",
+        "--method",
+        "Bug Fix",
+        "--role-profile",
+        "rca",
+        "--finding-id",
+        finding_id,
+    )
+    assert rca.returncode == 0, rca.stdout
+    rca_data = payload(rca)
+    assert (
+        run_cli(
+            root,
+            spec_dir,
+            "bind-launch",
+            "--run-id",
+            run_id,
+            "--assignment-id",
+            rca_data["assignment_id"],
+            "--attempt-id",
+            rca_data["attempt_id"],
+            "--host-handle",
+            "rca-review-1",
+        ).returncode
+        == 0
+    )
+    assert (
+        run_cli(
+            root,
+            spec_dir,
+            "record-result",
+            "--run-id",
+            run_id,
+            "--assignment-id",
+            rca_data["assignment_id"],
+            "--attempt-id",
+            rca_data["attempt_id"],
+            "--outcome",
+            "succeeded",
+        ).returncode
+        == 0
+    )
+
+    reviewer = finish_assignment(
+        root, spec_dir, run_id, "T1", "Review", "reviewer", "reviewer-after-replay"
+    )
+    repeated_report = tmp_path / "review-repeat-normalized.md"
+    repeated_report.write_text("The same blocker is still present.\n", encoding="utf-8")
+    repeated = submit_review(
+        root,
+        spec_dir,
+        run_id,
+        reviewer["assignment_id"],
+        candidate_id,
+        repeated_report,
+        outcome="fail",
+        summary="The reviewer confirms the existing blocker.",
+        findings=("  correct   THE blocking behavior.  ",),
+    )
+    assert repeated.returncode == 0, repeated.stdout
+    record = fuse_state.load_run(root, run_id)
+    finding = record["findings"][0]
+    assert finding["id"] == finding_id
+    assert finding["scope"] == "T1"
+    assert len(finding["evidence_ids"]) == 2
+    assert finding["history"][-1]["action"] == "confirmed"
+
+    reviewer = finish_assignment(
+        root, spec_dir, run_id, "T1", "Review", "reviewer", "reviewer-pass-after-replay"
+    )
+    pass_report = tmp_path / "review-pass-before-reopen.md"
+    pass_report.write_text("Verified the issue is fixed.\n", encoding="utf-8")
+    passing = submit_review(
+        root,
+        spec_dir,
+        run_id,
+        reviewer["assignment_id"],
+        candidate_id,
+        pass_report,
+        outcome="pass",
+        summary="The blocker is fixed",
+        resolve_finding_ids=(finding_id,),
+        resolution_rationale="The current candidate passes the reproduction.",
+    )
+    assert passing.returncode == 0, passing.stdout
+
+    reviewer = finish_assignment(
+        root, spec_dir, run_id, "T1", "Review", "reviewer", "reviewer-reopen"
+    )
+    reopened_report = tmp_path / "review-reopen.md"
+    reopened_report.write_text("The same issue is present again.\n", encoding="utf-8")
+    reopened = submit_review(
+        root,
+        spec_dir,
+        run_id,
+        reviewer["assignment_id"],
+        candidate_id,
+        reopened_report,
+        outcome="fail",
+        summary="A follow-up report found the issue again.",
+        findings=("The behavior still violates the original requirement.",),
+        repeat_finding_ids=(finding_id,),
+    )
+    assert reopened.returncode == 0, reopened.stdout
+    record = fuse_state.load_run(root, run_id)
+    assert len(record["findings"]) == 1
+    finding = record["findings"][0]
+    assert finding["id"] == finding_id
+    assert finding["status"] == "open"
+    assert len(finding["evidence_ids"]) == 4
+    assert finding["evidence_ids"][0] == first_evidence_id
+    assert len(finding["history"]) == 4
+    assert finding["history"][-1]["action"] == "reopened"
+    assert record["rca_attempts"] == [
+        {"finding_id": finding_id, "attempts_used": 1, "limit": 1}
+    ]
+    exhausted_rca = run_cli(
+        root,
+        spec_dir,
+        "prepare-dispatch",
+        "--run-id",
+        run_id,
+        "--task-id",
+        "T1",
+        "--method",
+        "Bug Fix",
+        "--role-profile",
+        "rca",
+        "--finding-id",
+        finding_id,
+    )
+    assert exhausted_rca.returncode != 0
+    assert payload(exhausted_rca)["reason"] == "rca_limit_exhausted"

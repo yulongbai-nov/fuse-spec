@@ -120,6 +120,7 @@ def _parser() -> argparse.ArgumentParser:
     check = commands.add_parser("run-check", help="run one configured check")
     _add_paths(check)
     check.add_argument("--run-id", required=True)
+    check.add_argument("--task-id", required=True)
     check.add_argument("--check-id", required=True)
     check.add_argument("--candidate-id")
 
@@ -134,6 +135,7 @@ def _parser() -> argparse.ArgumentParser:
     review.add_argument("--outcome", choices=("pass", "fail"), required=True)
     review.add_argument("--summary", required=True)
     review.add_argument("--finding", action="append", default=[])
+    review.add_argument("--repeat-finding-id", action="append", default=[])
     review.add_argument("--resolve-finding-id", action="append", default=[])
     review.add_argument("--resolution-rationale")
     review.add_argument("--report", required=True, type=Path)
@@ -574,6 +576,7 @@ def _run_check(
         spec,
         config,
         record,
+        task_id=args.task_id,
         check_id=args.check_id,
         candidate_id=args.candidate_id,
     )
@@ -589,6 +592,17 @@ def _run_check(
         result = fuse_checks.run_check(
             root, spec, config, record, candidate["candidate_id"], args.check_id
         )
+        if result["outcome"] in {"pass", "fail"}:
+            fuse_control.record_check_outcome(
+                record,
+                root,
+                spec,
+                config,
+                args.task_id,
+                args.check_id,
+                candidate["candidate_id"],
+                result["evidence_id"],
+            )
     finally:
         if len(record["evidence"]) != before:
             _save(root, record)
@@ -614,6 +628,7 @@ def _record_review(
         args.summary,
         report,
         finding_summaries=args.finding,
+        repeat_finding_ids=args.repeat_finding_id,
         resolve_finding_ids=args.resolve_finding_id,
         resolution_rationale=args.resolution_rationale,
     )

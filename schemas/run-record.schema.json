@@ -202,7 +202,7 @@
       "required": ["at", "action", "rationale", "evidence_ids"],
       "properties": {
         "at": { "type": "string", "format": "date-time" },
-        "action": { "enum": ["opened", "reopened", "resolved", "dismissed", "deferred"] },
+        "action": { "enum": ["opened", "confirmed", "reopened", "resolved", "dismissed", "deferred"] },
         "rationale": { "type": "string", "minLength": 1, "pattern": "\\S" },
         "evidence_ids": {
           "type": "array",
