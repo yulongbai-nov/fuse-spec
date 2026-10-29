@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import unicodedata
 import uuid
 from collections.abc import Mapping, Sequence
@@ -37,16 +38,210 @@ else:
         import fuse_record
         import plan_waves
 
-IMPLEMENTATION_METHODS = {
-    "Bug Fix",
-    "Feature",
-    "Performance Issue",
-    "Prototype",
-    "Refactoring",
-    "Runtime/Trace Forensics",
-    "Visual Parity",
-}
 REVIEW_ROLES = {"reviewer", "rca_reviewer"}
+
+
+def _route_catalog() -> tuple[Mapping[str, Any], dict[str, Mapping[str, Any]]]:
+    """Load the single Poteto route contract used by skill and validator."""
+    route_path = Path(__file__).resolve().parents[1] / "poteto-mode" / "routes.json"
+    try:
+        contract = json.loads(route_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ControlError(
+            "route_policy_invalid", f"cannot load Poteto routes: {error}"
+        ) from error
+    if not isinstance(contract, Mapping):
+        raise ControlError("route_policy_invalid", "Poteto route contract is invalid")
+    route_rows = contract.get("routes")
+    policy = contract.get("decision_contract")
+    if not isinstance(route_rows, list) or not isinstance(policy, Mapping):
+        raise ControlError(
+            "route_policy_invalid", "Poteto route contract is incomplete"
+        )
+    routes: dict[str, Mapping[str, Any]] = {}
+    for route in route_rows:
+        if not isinstance(route, Mapping) or not isinstance(route.get("method"), str):
+            raise ControlError("route_policy_invalid", "Poteto route entry is invalid")
+        method = route["method"]
+        if method in routes:
+            raise ControlError(
+                "route_policy_invalid", f"duplicate Poteto route {method}"
+            )
+        routes[method] = route
+    return policy, routes
+
+
+def is_conditional_route(method: str) -> bool:
+    """Return whether the authoritative route table marks a method conditional."""
+    _policy, routes = _route_catalog()
+    route = routes.get(method)
+    return route is not None and route.get("conditional") is True
+
+
+def _route_decision(
+    method: str,
+    *,
+    root: Path,
+    spec: Path,
+    config: Mapping[str, Any],
+    record: Mapping[str, Any],
+    task_id: str,
+    route_rationale: str | None,
+    route_evidence_refs: Sequence[str],
+    source_route: str | None,
+    route_candidate_id: str | None,
+) -> dict[str, Any] | TransitionDecision | None:
+    """Validate structural route evidence and return its immutable record value."""
+    policy, routes = _route_catalog()
+    route = routes.get(method)
+    if route is None:
+        if (
+            route_rationale is not None
+            or route_evidence_refs
+            or source_route is not None
+        ):
+            return _deny(
+                "route_metadata_not_allowed",
+                "route metadata is only accepted for conditional implementation routes",
+            )
+        return None
+    if route.get("conditional") is not True:
+        if (
+            route_rationale is not None
+            or route_evidence_refs
+            or source_route is not None
+        ):
+            return _deny(
+                "route_metadata_not_allowed",
+                "ordinary routes do not require conditional route metadata",
+            )
+        return None
+
+    if not isinstance(route_rationale, str) or not route_rationale.strip():
+        return _deny(
+            "route_rationale_required",
+            "conditional routes require a concise rationale before dispatch",
+        )
+    rationale_max = policy.get("rationale_max_chars")
+    if not isinstance(rationale_max, int) or rationale_max < 1:
+        return _deny("route_policy_invalid", "route rationale limit is invalid")
+    rationale = route_rationale.strip()
+    if len(rationale) > rationale_max:
+        return _deny(
+            "route_rationale_too_long",
+            f"route rationale must be at most {rationale_max} characters",
+        )
+    if (
+        isinstance(route_evidence_refs, str)
+        or not route_evidence_refs
+        or any(
+            not isinstance(reference, str) or not reference.strip()
+            for reference in route_evidence_refs
+        )
+    ):
+        return _deny(
+            "route_evidence_required",
+            "conditional routes require one or more non-empty evidence references",
+        )
+    references = [reference.strip() for reference in route_evidence_refs]
+    if len(references) != len(set(references)):
+        return _deny(
+            "route_evidence_duplicate", "route evidence references must be unique"
+        )
+
+    try:
+        tasks_text = (spec / "tasks.md").read_text(encoding="utf-8")
+        tasks, duplicates, _done = plan_waves.parse_task_declarations(tasks_text)
+    except (OSError, UnicodeError) as error:
+        return _deny("approved_spec_incomplete", f"cannot read tasks.md: {error}")
+    if duplicates:
+        return _deny(
+            "task_graph_invalid",
+            "duplicate task id " + ", ".join(sorted(duplicates)),
+        )
+    task_declaration = tasks.get(task_id)
+    task_refs = set(task_declaration["impl"] if task_declaration else ())
+    evidence_prefix = policy.get("evidence_ref_prefix")
+    if not isinstance(evidence_prefix, str) or not evidence_prefix:
+        return _deny("route_policy_invalid", "route evidence prefix is invalid")
+    for reference in references:
+        if reference in task_refs:
+            continue
+        if not reference.startswith(evidence_prefix):
+            return _deny(
+                "route_evidence_unrecognized",
+                f"evidence reference {reference!r} is not a task impl "
+                "reference or source path",
+            )
+        relative_text = reference[len(evidence_prefix) :]
+        relative = Path(relative_text)
+        if not relative_text or relative.is_absolute() or ".." in relative.parts:
+            return _deny(
+                "route_evidence_unrecognized",
+                f"source evidence reference {reference!r} is not repository-relative",
+            )
+        try:
+            source_path = (root / relative).resolve(strict=True)
+            source_path.relative_to(root.resolve(strict=True))
+        except (OSError, RuntimeError, ValueError):
+            return _deny(
+                "route_evidence_unavailable",
+                f"source evidence reference {reference!r} is unavailable "
+                "in the repository",
+            )
+        if not source_path.is_file():
+            return _deny(
+                "route_evidence_unavailable",
+                f"source evidence reference {reference!r} is not a file",
+            )
+
+    source_routes = route.get("source_routes")
+    if isinstance(source_routes, Mapping):
+        if source_route is None:
+            return _deny(
+                "route_source_required",
+                "Runtime/Trace Forensics requires a declared source route",
+            )
+        if source_route not in source_routes:
+            return _deny(
+                "route_source_invalid",
+                "source route must be one of the declared forensic routes",
+                allowed_source_routes=sorted(source_routes),
+            )
+    elif source_route is not None:
+        return _deny(
+            "route_source_not_allowed", "this route does not declare forensic sources"
+        )
+
+    if route_candidate_id is None:
+        return _deny(
+            "route_candidate_required",
+            "conditional route decisions must be bound to the current candidate",
+        )
+    try:
+        expected_candidate = _candidate(
+            record, root, _manifest(record, root, spec, config)
+        )["candidate_id"]
+    except (ControlError, KeyError, TypeError) as error:
+        return _deny("candidate_invalid", str(error))
+    known_candidates = {item["candidate_id"] for item in record["candidates"]}
+    if route_candidate_id not in known_candidates:
+        return _deny(
+            "route_candidate_unknown",
+            "route candidate is not persisted in the run record",
+        )
+    if route_candidate_id != expected_candidate:
+        return _deny(
+            "route_candidate_stale", "route candidate does not match current content"
+        )
+    result = {
+        "rationale": rationale,
+        "evidence_refs": references,
+        "candidate_id": route_candidate_id,
+    }
+    if source_route is not None:
+        result["source_route"] = source_route
+    return result
 
 
 @dataclass(frozen=True)
@@ -76,6 +271,10 @@ class ControlError(ValueError):
         super().__init__(message)
         self.reason = reason
         self.details = dict(details or {})
+
+
+# The JSON route catalog is the sole source of implementation method names.
+IMPLEMENTATION_METHODS = frozenset(_route_catalog()[1])
 
 
 def _allow(message: str = "transition is valid", **details: Any) -> TransitionDecision:
@@ -627,6 +826,10 @@ def validate_transition(
     host_handle: str | None = None,
     candidate_id: str | None = None,
     finding_id: str | None = None,
+    route_rationale: str | None = None,
+    route_evidence_refs: Sequence[str] = (),
+    source_route: str | None = None,
+    route_candidate_id: str | None = None,
     review_outcome: str | None = None,
     finding_summaries: Sequence[str] = (),
     repeat_finding_ids: Sequence[str] = (),
@@ -694,6 +897,23 @@ def validate_transition(
             )
         if method not in IMPLEMENTATION_METHODS | {"Review"}:
             return _deny("unknown_method", f"method {method!r} is not supported")
+        try:
+            route_decision = _route_decision(
+                method,
+                root=root,
+                spec=spec,
+                config=config,
+                record=current,
+                task_id=task_id,
+                route_rationale=route_rationale,
+                route_evidence_refs=route_evidence_refs,
+                source_route=source_route,
+                route_candidate_id=route_candidate_id,
+            )
+        except ControlError as error:
+            return _deny(error.reason, str(error), **error.details)
+        if isinstance(route_decision, TransitionDecision):
+            return route_decision
         role = cast(Mapping[str, Any], roles[role_profile])
         is_reviewer = role_profile in REVIEW_ROLES
         is_rca = role_profile == "rca"
@@ -900,7 +1120,12 @@ def validate_transition(
             role_profile=role_profile,
             reserved_capacity=1,
             capacity_limit=cap,
-            candidate_id=candidate_id_for_dispatch,
+            candidate_id=(
+                route_candidate_id
+                if isinstance(route_decision, Mapping)
+                else candidate_id_for_dispatch
+            ),
+            route_decision=route_decision,
             finding_id=finding_id,
             repair_kind=repair_kind,
             eligible_independent_task_workers=eligible_count,

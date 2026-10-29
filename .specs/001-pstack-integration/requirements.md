@@ -142,10 +142,22 @@ The generation of a review verdict or planning proposal is not deterministic. Th
 1. WHEN assigning a worker or reviewer THEN Fuse SHALL choose from configured role profiles whose required tools and model can be used on the execution host. Unsupported cognitive capability probes are not required.
 2. IF the configured choice is unavailable THEN Fuse SHALL use only a policy-permitted fallback or report a blocker. Selection, fallback, and escalation SHALL be recorded under R3.
 3. WHEN observed complexity warrants reassignment or replanning THEN the Fuse executor SHALL act only within the configured autonomy and resource limits, preserving the task's required checks.
-4. WHEN a hard blocker needs RCA escalation THEN Fuse SHALL assign Astra with Max reasoning where supported to diagnose and repair it within the configured RCA allowance. Selection SHALL validate the actual model, reasoning setting, tools, and host availability, and record the reason for escalation. Stronger-model selection SHALL NOT increase the repair allowance or bypass independent verification; any nested agents SHALL count toward the run's concurrency and resource limits.
-5. WHEN assigning an ordinary worker THEN Fuse SHALL prefer the latest Luna model available to the host with maximum supported reasoning effort. Fuse SHALL resolve and record the actual model identifier and reasoning setting for the run. IF the preference is unavailable, Fuse SHALL report the limitation or use only an explicitly permitted fallback; it SHALL NOT silently claim the preferred profile was used.
-6. WHEN assigning a regular independent reviewer THEN Fuse SHALL prefer the latest Sol model available to the host with Extra High reasoning (`xhigh` where that is the host setting). Fuse SHALL record the actual model and reasoning setting; if unavailable it SHALL report the limitation or use only an explicitly permitted fallback. This concrete reviewer profile SHALL govern in place of abstract model-tier arithmetic; reviewer independence under R4 still applies.
-7. WHEN an Astra RCA agent changes code THEN Fuse SHALL obtain an additional independent review of that fix using a separate Astra agent with Max reasoning where supported, even if another review level already assessed the change. This review SHALL verify the RCA result and its evidence under R4. If Astra or Max is unavailable, Fuse SHALL report the limitation and use only an explicitly permitted fallback.
+4. WHEN a hard blocker needs RCA escalation THEN Fuse SHALL assign the configured RCA role to diagnose and repair it within the configured RCA allowance. Resolve and record the model, reasoning setting, tools, host availability, and reason for escalation according to the role defaults below. Model selection SHALL NOT increase the repair allowance or bypass independent verification; any nested agents SHALL count toward the run's concurrency and resource limits.
+5. WHEN assigning an ordinary worker THEN Fuse SHALL use the configured worker role profile and resolve and record the actual model identifier and reasoning setting according to the role defaults below. IF the configured preference is unavailable, Fuse SHALL report the limitation or use only an explicitly permitted fallback; it SHALL NOT silently claim the preferred profile was used.
+6. WHEN assigning a regular independent reviewer THEN Fuse SHALL use the configured reviewer role profile and record the actual model and reasoning setting according to the role defaults below. If unavailable, it SHALL report the limitation or use only an explicitly permitted fallback. Reviewer independence under R4 still applies.
+7. WHEN an RCA agent changes code THEN Fuse SHALL obtain an additional independent review using the configured RCA-reviewer role profile, even if another review level already assessed the change. This review SHALL verify the RCA result and its evidence under R4. If that configured profile is unavailable, Fuse SHALL report the limitation or use only an explicitly permitted fallback.
+
+**Initial configurable role defaults:**
+
+| Role profile | Initial model preference | Reasoning |
+| --- | --- | --- |
+| manager | Latest Astra available to the host | Max |
+| worker | Latest Luna available to the host | Max |
+| reviewer | Latest Luna available to the host | Max |
+| rca | Latest Luna available to the host | Max |
+| rca_reviewer | Latest Luna available to the host | Max |
+
+Every model, reasoning setting, and resource limit remains configurable and subject to host and configured budget availability. Luna Max does not imply unlimited usage. This table supersedes the earlier Astra RCA/reviewer and Sol-xhigh regular-reviewer defaults.
 
 ### R8: Establish reproducible repository and verification readiness
 

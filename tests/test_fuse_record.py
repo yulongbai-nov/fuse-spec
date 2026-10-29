@@ -259,6 +259,50 @@ def test_rca_candidate_and_review_context_survive_retry_and_are_immutable() -> N
         fuse_record.validate_run_record(record, previous=before)
 
 
+def test_conditional_route_decision_is_candidate_bound_and_immutable() -> None:
+    record = make_record()
+    candidate = fuse_record.add_candidate(record, {"source": "route baseline"})
+    route_decision = {
+        "rationale": "The approved task has a measurable target.",
+        "evidence_refs": ["R1", "D-Test"],
+        "candidate_id": candidate["candidate_id"],
+    }
+    assignment = fuse_record.prepare_assignment(
+        record,
+        "T1",
+        "Performance Issue",
+        "worker",
+        route_decision=route_decision,
+    )
+    previous = copy.deepcopy(record)
+
+    assert assignment["route_decision"] == route_decision
+    changed = copy.deepcopy(record)
+    changed["assignments"][0]["route_decision"]["rationale"] = (
+        "A different route was intended."
+    )
+    with pytest.raises(
+        fuse_record.RecordError, match="assignment route_decision is immutable"
+    ):
+        fuse_record.validate_run_record(changed, previous=previous)
+
+
+def test_route_decision_requires_a_persisted_candidate() -> None:
+    record = make_record()
+    with pytest.raises(fuse_record.RecordError, match="persisted candidate"):
+        fuse_record.prepare_assignment(
+            record,
+            "T1",
+            "Visual Parity",
+            "worker",
+            route_decision={
+                "rationale": "The approved task requests exact parity.",
+                "evidence_refs": ["R1"],
+                "candidate_id": "0" * 64,
+            },
+        )
+
+
 def test_check_finding_rejects_generic_resolution_and_superseded_pass() -> None:
     record = make_record()
     candidate_id = fuse_record.add_candidate(record, {"source": "current"})[

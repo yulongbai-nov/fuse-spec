@@ -88,9 +88,11 @@ def test_init_reuses_project_package_manager_and_creates_valid_policy(
     config = tomllib.loads(config_path.read_text(encoding="utf-8"))
     assert config["roles"]["manager"]["model"] == "latest-astra"
     assert config["roles"]["worker"]["model"] == "latest-luna"
-    assert config["roles"]["reviewer"]["reasoning_effort"] == "xhigh"
-    assert config["roles"]["rca"]["model"] == "latest-astra"
+    assert config["roles"]["reviewer"]["model"] == "latest-luna"
+    assert config["roles"]["reviewer"]["reasoning_effort"] == "max"
+    assert config["roles"]["rca"]["model"] == "latest-luna"
     assert config["roles"]["rca_reviewer"]["reasoning_effort"] == "max"
+    assert config["roles"]["rca_reviewer"]["model"] == "latest-luna"
     assert config["limits"]["review"]["max_repair_rounds_per_level"] == 2
     assert config["limits"]["rca"]["attempts_per_hard_blocker"] == 1
     assert config["budgets"]["elapsed_time_seconds"] == "unset"
@@ -482,8 +484,11 @@ def test_invalid_role_profile_is_rejected(tmp_path: Path) -> None:
     project_root = tmp_path / "consumer"
     project_root.mkdir()
     config_path = create_config(project_root)
-    replace_config_text(
-        config_path, 'reasoning_effort = "xhigh"', 'reasoning_effort = "instant"'
+    replace_section_value(
+        config_path,
+        "roles.reviewer",
+        'reasoning_effort = "max"',
+        'reasoning_effort = "instant"',
     )
 
     result = run_config("validate", str(config_path))

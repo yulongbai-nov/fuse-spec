@@ -110,6 +110,14 @@ def _semantic_errors(record: Mapping[str, Any]) -> list[str]:
         task_id = assignment["task_id"]
         if task_id not in tasks:
             errors.append(f"assignment {assignment['id']} has no task-state entry")
+        route_decision = assignment.get("route_decision")
+        if isinstance(route_decision, Mapping):
+            route_candidate_id = route_decision.get("candidate_id")
+            if route_candidate_id not in candidate_ids:
+                errors.append(
+                    f"assignment {assignment['id']} route decision references "
+                    "an unknown candidate"
+                )
         latest = assignment["attempts"][-1]
         if assignment["status"] != latest["status"]:
             errors.append(
@@ -315,8 +323,14 @@ def _validate_history(previous: Mapping[str, Any], current: Mapping[str, Any]) -
     new_assignments = current["assignments"]
     _require_prefix(old_assignments, new_assignments, "id", "assignment")
     for old_assignment, new_assignment in zip(old_assignments, new_assignments):
-        for field in ("task_id", "method", "role_profile", "reserved_capacity"):
-            if old_assignment[field] != new_assignment[field]:
+        for field in (
+            "task_id",
+            "method",
+            "role_profile",
+            "reserved_capacity",
+            "route_decision",
+        ):
+            if old_assignment.get(field) != new_assignment.get(field):
                 raise RecordError(f"assignment {field} is immutable")
         old_attempts = old_assignment["attempts"]
         new_attempts = new_assignment["attempts"]
@@ -510,6 +524,7 @@ def prepare_assignment(
     finding_id: str | None = None,
     rca_base_candidate_id: str | None = None,
     rca_attempt_ids: Sequence[str] = (),
+    route_decision: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Persist an assignment and reserve capacity before any host launch."""
     if any(
@@ -556,6 +571,11 @@ def prepare_assignment(
         "created_at": now,
         "attempts": [attempt],
     }
+    if route_decision is not None:
+        candidate_id = route_decision.get("candidate_id")
+        if candidate_id not in {item["candidate_id"] for item in record["candidates"]}:
+            raise RecordError("route decision requires a persisted candidate")
+        assignment["route_decision"] = copy.deepcopy(dict(route_decision))
     task = record["tasks"].setdefault(
         task_id,
         {

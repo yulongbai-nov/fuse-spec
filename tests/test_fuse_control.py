@@ -1659,6 +1659,280 @@ def test_review_artifact_symlink_cannot_escape_run_root(tmp_path: Path) -> None:
     assert list(outside.iterdir()) == []
 
 
+@pytest.mark.parametrize(
+    ("method", "source_route"),
+    [
+        ("Performance Issue", None),
+        ("Runtime/Trace Forensics", "live_process"),
+        ("Runtime/Trace Forensics", "existing_trace"),
+        ("Prototype", None),
+        ("Visual Parity", None),
+    ],
+)
+def test_conditional_routes_record_task_and_candidate_bound_decisions(
+    tmp_path: Path, method: str, source_route: str | None
+) -> None:
+    tasks = (
+        "# Tasks\n\n"
+        "- [ ] T1 Conditional work [id:T1 deps: impl:R1,D-Test]\n"
+        "    - **Files:** `app.py`\n"
+    )
+    root, spec_dir = make_project(tmp_path, tasks)
+    evidence_refs = ["R1", "D-Test"]
+    if method == "Runtime/Trace Forensics" and source_route == "existing_trace":
+        diagnostic = root / "diagnostics" / "trace.json"
+        diagnostic.parent.mkdir()
+        diagnostic.write_text('{"sample": true}\n', encoding="utf-8")
+        evidence_refs = ["source:diagnostics/trace.json"]
+    run_id = initialized_run(root, spec_dir)
+    arguments = [
+        "--run-id",
+        run_id,
+        "--task-id",
+        "T1",
+        "--method",
+        method,
+        "--role-profile",
+        "worker",
+        "--route-rationale",
+        "The approved task matches this conditional method.",
+    ]
+    for reference in evidence_refs:
+        arguments.extend(["--route-evidence-ref", reference])
+    if source_route is not None:
+        arguments.extend(["--source-route", source_route])
+
+    result = run_cli(root, spec_dir, "prepare-dispatch", *arguments)
+    assert result.returncode == 0, result.stdout
+    response = payload(result)
+    record = fuse_state.load_run(root, run_id)
+    assignment = record["assignments"][-1]
+    route_decision = assignment["route_decision"]
+
+    assert assignment["task_id"] == "T1"
+    assert assignment["method"] == method
+    assert (
+        route_decision["rationale"]
+        == "The approved task matches this conditional method."
+    )
+    assert route_decision["evidence_refs"] == evidence_refs
+    assert route_decision["candidate_id"] == response["candidate_id"]
+    assert route_decision["candidate_id"] in {
+        item["candidate_id"] for item in record["candidates"]
+    }
+    if source_route is not None:
+        assert route_decision["source_route"] == source_route
+
+
+@pytest.mark.parametrize(
+    ("method", "source_route"),
+    [
+        ("Performance Issue", None),
+        ("Runtime/Trace Forensics", "live_process"),
+        ("Runtime/Trace Forensics", "existing_trace"),
+        ("Prototype", None),
+        ("Visual Parity", None),
+    ],
+)
+def test_conditional_routes_reject_unlinked_evidence_references(
+    tmp_path: Path, method: str, source_route: str | None
+) -> None:
+    tasks = (
+        "# Tasks\n\n"
+        "- [ ] T1 Conditional work [id:T1 deps: impl:R1,D-Test]\n"
+        "    - **Files:** `app.py`\n"
+    )
+    root, spec_dir = make_project(tmp_path, tasks)
+    run_id = initialized_run(root, spec_dir)
+    arguments = [
+        "--run-id",
+        run_id,
+        "--task-id",
+        "T1",
+        "--method",
+        method,
+        "--role-profile",
+        "worker",
+        "--route-rationale",
+        "The approved task appears to match this route.",
+        "--route-evidence-ref",
+        "R999",
+    ]
+    if source_route is not None:
+        arguments.extend(["--source-route", source_route])
+
+    result = run_cli(root, spec_dir, "prepare-dispatch", *arguments)
+
+    assert result.returncode != 0
+    assert payload(result)["reason"] == "route_evidence_unrecognized"
+    assert fuse_state.load_run(root, run_id)["assignments"] == []
+
+
+@pytest.mark.parametrize(
+    "method",
+    ["Performance Issue", "Runtime/Trace Forensics", "Prototype", "Visual Parity"],
+)
+def test_conditional_routes_require_a_route_rationale(
+    tmp_path: Path, method: str
+) -> None:
+    tasks = (
+        "# Tasks\n\n"
+        "- [ ] T1 Conditional work [id:T1 deps: impl:R1,D-Test]\n"
+        "    - **Files:** `app.py`\n"
+    )
+    root, spec_dir = make_project(tmp_path, tasks)
+    run_id = initialized_run(root, spec_dir)
+
+    result = run_cli(
+        root,
+        spec_dir,
+        "prepare-dispatch",
+        "--run-id",
+        run_id,
+        "--task-id",
+        "T1",
+        "--method",
+        method,
+        "--role-profile",
+        "worker",
+    )
+
+    assert result.returncode != 0
+    assert payload(result)["reason"] == "route_rationale_required"
+
+
+def test_conditional_routes_require_evidence_references(tmp_path: Path) -> None:
+    tasks = (
+        "# Tasks\n\n"
+        "- [ ] T1 Conditional work [id:T1 deps: impl:R1,D-Test]\n"
+        "    - **Files:** `app.py`\n"
+    )
+    root, spec_dir = make_project(tmp_path, tasks)
+    run_id = initialized_run(root, spec_dir)
+
+    result = run_cli(
+        root,
+        spec_dir,
+        "prepare-dispatch",
+        "--run-id",
+        run_id,
+        "--task-id",
+        "T1",
+        "--method",
+        "Performance Issue",
+        "--role-profile",
+        "worker",
+        "--route-rationale",
+        "The task defines a measurable target.",
+    )
+
+    assert result.returncode != 0
+    assert payload(result)["reason"] == "route_evidence_required"
+
+
+def test_conditional_route_accepts_an_existing_repository_source_reference(
+    tmp_path: Path,
+) -> None:
+    tasks = (
+        "# Tasks\n\n"
+        "- [ ] T1 Conditional work [id:T1 deps: impl:]\n"
+        "    - **Files:** `app.py`\n"
+    )
+    root, spec_dir = make_project(tmp_path, tasks)
+    source = root / "diagnostics" / "profile.txt"
+    source.parent.mkdir()
+    source.write_text("captured profile\n", encoding="utf-8")
+    run_id = initialized_run(root, spec_dir)
+
+    result = run_cli(
+        root,
+        spec_dir,
+        "prepare-dispatch",
+        "--run-id",
+        run_id,
+        "--task-id",
+        "T1",
+        "--method",
+        "Runtime/Trace Forensics",
+        "--role-profile",
+        "worker",
+        "--route-rationale",
+        "An existing diagnostic profile is available.",
+        "--route-evidence-ref",
+        "source:diagnostics/profile.txt",
+        "--source-route",
+        "existing_trace",
+    )
+
+    assert result.returncode == 0, result.stdout
+    route = fuse_state.load_run(root, run_id)["assignments"][0]["route_decision"]
+    assert route["evidence_refs"] == ["source:diagnostics/profile.txt"]
+
+
+def test_conditional_route_rejects_missing_or_escaping_source_reference(
+    tmp_path: Path,
+) -> None:
+    tasks = (
+        "# Tasks\n\n"
+        "- [ ] T1 Conditional work [id:T1 deps: impl:R1,D-Test]\n"
+        "    - **Files:** `app.py`\n"
+    )
+    root, spec_dir = make_project(tmp_path, tasks)
+    run_id = initialized_run(root, spec_dir)
+
+    result = run_cli(
+        root,
+        spec_dir,
+        "prepare-dispatch",
+        "--run-id",
+        run_id,
+        "--task-id",
+        "T1",
+        "--method",
+        "Prototype",
+        "--role-profile",
+        "worker",
+        "--route-rationale",
+        "The disposable experiment needs a captured input.",
+        "--route-evidence-ref",
+        "source:../outside.log",
+    )
+
+    assert result.returncode != 0
+    assert payload(result)["reason"] == "route_evidence_unrecognized"
+
+
+def test_runtime_forensics_requires_a_declared_source_route(tmp_path: Path) -> None:
+    tasks = (
+        "# Tasks\n\n"
+        "- [ ] T1 Conditional work [id:T1 deps: impl:R1,D-Test]\n"
+        "    - **Files:** `app.py`\n"
+    )
+    root, spec_dir = make_project(tmp_path, tasks)
+    run_id = initialized_run(root, spec_dir)
+
+    result = run_cli(
+        root,
+        spec_dir,
+        "prepare-dispatch",
+        "--run-id",
+        run_id,
+        "--task-id",
+        "T1",
+        "--method",
+        "Runtime/Trace Forensics",
+        "--role-profile",
+        "worker",
+        "--route-rationale",
+        "The approved task calls for forensic diagnosis.",
+        "--route-evidence-ref",
+        "R1",
+    )
+
+    assert result.returncode != 0
+    assert payload(result)["reason"] == "route_source_required"
+
+
 def test_luna_max_capacity_expands_to_independent_ready_task_count(
     tmp_path: Path,
 ) -> None:

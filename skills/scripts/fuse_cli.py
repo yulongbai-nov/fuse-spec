@@ -94,6 +94,9 @@ def _parser() -> argparse.ArgumentParser:
     prepare.add_argument("--method", required=True)
     prepare.add_argument("--role-profile", required=True)
     prepare.add_argument("--finding-id")
+    prepare.add_argument("--route-rationale")
+    prepare.add_argument("--route-evidence-ref", action="append", default=[])
+    prepare.add_argument("--source-route")
 
     bind = commands.add_parser("bind-launch", help="bind a returned host handle")
     _add_paths(bind)
@@ -426,6 +429,11 @@ def _prepare(
     args: argparse.Namespace,
 ) -> None:
     record = _load_run(root, spec, args.run_id)
+    route_candidate_id = None
+    if fuse_control.is_conditional_route(args.method):
+        route_candidate_id = fuse_control.current_candidate(record, root, spec, config)[
+            "candidate_id"
+        ]
     try:
         decision = _decision(
             "prepare-dispatch",
@@ -437,6 +445,10 @@ def _prepare(
             method=args.method,
             role_profile=args.role_profile,
             finding_id=args.finding_id,
+            route_rationale=args.route_rationale,
+            route_evidence_refs=args.route_evidence_ref,
+            source_route=args.source_route,
+            route_candidate_id=route_candidate_id,
         )
     except fuse_control.ControlError as error:
         if error.reason in {
@@ -475,6 +487,7 @@ def _prepare(
             if args.role_profile == "rca_reviewer"
             else ()
         ),
+        route_decision=decision.details.get("route_decision"),
     )
     repair_kind = decision.details.get("repair_kind")
     if repair_kind == "task":
@@ -501,6 +514,7 @@ def _prepare(
         assignment_id=assignment["id"],
         attempt_id=assignment["attempts"][-1]["id"],
         candidate_id=decision.details["candidate_id"] or None,
+        route_decision=assignment.get("route_decision"),
         finding_id=args.finding_id,
         reserved_capacity=fuse_record.reserved_capacity(record),
         capacity_limit=decision.details["capacity_limit"],

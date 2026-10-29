@@ -15,21 +15,21 @@ unavailable_policy = "block"
 fallback_roles = []
 
 [roles.reviewer]
-model = "latest-sol"
-reasoning_effort = "xhigh"
+model = "latest-luna"
+reasoning_effort = "max"
 required_tools = ["filesystem.read", "commands.execute"]
 unavailable_policy = "block"
 fallback_roles = []
 
 [roles.rca]
-model = "latest-astra"
+model = "latest-luna"
 reasoning_effort = "max"
 required_tools = ["filesystem.read", "filesystem.write", "commands.execute"]
 unavailable_policy = "block"
 fallback_roles = []
 
 [roles.rca_reviewer]
-model = "latest-astra"
+model = "latest-luna"
 reasoning_effort = "max"
 required_tools = ["filesystem.read", "commands.execute"]
 unavailable_policy = "block"
