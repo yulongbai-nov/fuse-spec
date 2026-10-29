@@ -22,4 +22,4 @@ Each task is one checklist line ending in an inline tag the scripts parse:
 - [x] T3 Deduplicate test Git and repository setup helpers  [id:T3 deps: impl:R3,D-TestSupport]
     - **Files:** `tests/_support.py`, candidate/check/state/PR/control/verification tests.
     - Keep repository-specific remotes and race fixtures in their existing test modules.
-- [ ] T4 Run full verification and whole-codebase cleanup review  [id:T4 deps:T1,T2,T3 impl:R4,D-CanonicalHelpers,D-TestSupport]
+- [x] T4 Run full verification and whole-codebase cleanup review  [id:T4 deps:T1,T2,T3 impl:R4,D-CanonicalHelpers,D-TestSupport]
