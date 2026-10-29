@@ -412,8 +412,6 @@ def checkpoint_run(
         validate_run_record(record, previous=previous)
 
     remote_revision, remote_record = _fetch_remote_state(root, remote, spec_id, run_id)
-    if remote_record is not None:
-        validate_run_record(record, previous=remote_record)
     if remote_revision != expected_revision:
         reconciliation = (
             reconcile_remote(record, remote_record)
@@ -441,6 +439,9 @@ def checkpoint_run(
             remote_record,
             reconcile_remote(record, remote_record),
         )
+
+    if remote_record is not None:
+        validate_run_record(record, previous=remote_record)
 
     candidate = copy.deepcopy(record)
     candidate["git"]["state_ref"] = ref

@@ -69,7 +69,13 @@ def test_local_run_record_directory_is_ignored_by_feature_commits() -> None:
 
 
 def competitor_advance(
-    tmp_path: Path, remote: Path, ref: str, run_id: str, *, push: bool = True
+    tmp_path: Path,
+    remote: Path,
+    ref: str,
+    run_id: str,
+    *,
+    push: bool = True,
+    append_decision: bool = False,
 ) -> tuple[Path, str]:
     competitor = tmp_path / "competitor"
     subprocess.run(
@@ -85,6 +91,15 @@ def competitor_advance(
     data = json.loads(record_path.read_text(encoding="utf-8"))
     data["status"] = "paused"
     data["git"]["state_revision"] += 1
+    if append_decision:
+        data["operator_decisions"].append(
+            {
+                "id": "dec_" + "9" * 32,
+                "at": data["checkpointed_at"],
+                "decision": "continue",
+                "rationale": "competitor checkpointed an operator decision",
+            }
+        )
     record_path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
     git(competitor, "add", record_path.relative_to(competitor).as_posix())
     git(competitor, "commit", "-m", "competing state update")
@@ -164,6 +179,34 @@ def test_competing_update_is_fetched_and_reconciled_before_more_work(
     assert reconciliation["status"] == "conflict"
     assert "status" in reconciliation["changed_fields"]
     assert git(remote, "rev-parse", ref) == competing_revision
+
+
+def test_stale_checkpoint_with_remote_history_change_returns_state_conflict(
+    tmp_path: Path,
+) -> None:
+    repository, remote = repository_with_bare_remote(tmp_path)
+    record = fuse_state.initialize_run(repository, "001-demo", {"roles": {}})
+    ref = fuse_state.state_ref(record["spec_id"], record["run_id"])
+    original_revision = fuse_state.checkpoint_run(repository, remote, record)
+    _, competing_revision = competitor_advance(
+        tmp_path, remote, ref, record["run_id"], append_decision=True
+    )
+    record["status"] = "completed"
+
+    with pytest.raises(fuse_state.StateConflict) as caught:
+        fuse_state.checkpoint_run(
+            repository, remote, record, expected_revision=original_revision
+        )
+
+    conflict = caught.value
+    assert conflict.remote_revision == competing_revision
+    assert conflict.remote_record is not None
+    assert conflict.remote_record["operator_decisions"][-1]["rationale"] == (
+        "competitor checkpointed an operator decision"
+    )
+    assert conflict.reconciliation is not None
+    assert conflict.reconciliation["status"] == "conflict"
+    assert "operator_decisions" in conflict.reconciliation["changed_fields"]
 
 
 def test_checkpoint_rejects_stale_expected_revision(tmp_path: Path) -> None:
