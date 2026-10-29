@@ -34,7 +34,12 @@ if TYPE_CHECKING:
     from fuse_graph import (
         ready_check_ids as graph_ready_check_ids,
     )
-    from fuse_record import add_evidence, evidence_available, validate_run_record
+    from fuse_record import (
+        add_evidence,
+        canonical_json_digest,
+        evidence_available,
+        validate_run_record,
+    )
 else:
     try:
         from .fuse_artifacts import ArtifactError, write_run_artifact
@@ -50,7 +55,12 @@ else:
         from .fuse_graph import (
             ready_check_ids as graph_ready_check_ids,
         )
-        from .fuse_record import add_evidence, evidence_available, validate_run_record
+        from .fuse_record import (
+            add_evidence,
+            canonical_json_digest,
+            evidence_available,
+            validate_run_record,
+        )
     except ImportError:
         from fuse_artifacts import ArtifactError, write_run_artifact
         from fuse_candidate import (
@@ -65,7 +75,12 @@ else:
         from fuse_graph import (
             ready_check_ids as graph_ready_check_ids,
         )
-        from fuse_record import add_evidence, evidence_available, validate_run_record
+        from fuse_record import (
+            add_evidence,
+            canonical_json_digest,
+            evidence_available,
+            validate_run_record,
+        )
 
 
 class CheckError(ValueError):
@@ -575,17 +590,6 @@ def _pinned_worktree(
         yield worktree, commit_id, tree_id
 
 
-def _canonical_digest(value: Any) -> str:
-    payload = json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
-
-
 def _safe_version(
     command: list[str], repository_root: Path, *, timeout: float = 10
 ) -> str:
@@ -748,8 +752,8 @@ def _record_result(
         artifacts=artifacts,
         source_provenance=source,
         tool_versions=tool_versions,
-        config_digest=_canonical_digest(config),
-        check_definition_digest=_canonical_digest(check),
+        config_digest=canonical_json_digest(config),
+        check_definition_digest=canonical_json_digest(check),
     )
 
 
@@ -961,8 +965,8 @@ def _validate_check_evidence_context(
     _candidate_matches_config(candidate, config)
     if check_id not in config["checks"]:
         raise CheckError(f"unknown project check {check_id}")
-    expected_config_digest = _canonical_digest(config)
-    expected_check_digest = _canonical_digest(config["checks"][check_id])
+    expected_config_digest = canonical_json_digest(config)
+    expected_check_digest = canonical_json_digest(config["checks"][check_id])
     if evidence.get("config_digest") != expected_config_digest:
         raise CheckError(f"check {check_id} evidence configuration digest mismatch")
     if evidence.get("check_definition_digest") != expected_check_digest:
@@ -1234,8 +1238,8 @@ def run_check(
             "check_id": check_id,
             "configured_command": configured_command,
             "executed_command": command,
-            "config_digest": _canonical_digest(config),
-            "check_definition_digest": _canonical_digest(check),
+            "config_digest": canonical_json_digest(config),
+            "check_definition_digest": canonical_json_digest(check),
             "source_commit": source["commit"],
             "pinned_commit": pinned_commit,
             "pinned_tree": pinned_tree,

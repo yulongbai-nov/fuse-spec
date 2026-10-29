@@ -6,6 +6,7 @@ import copy
 import hashlib
 import importlib
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,24 @@ def make_record() -> Any:
         "001-demo",
         {"roles": {"worker": {"model": "example-model"}}, "limits": {}},
     )
+
+
+def test_canonical_json_digest_preserves_unicode_and_rejects_nonfinite_values() -> None:
+    value = {"z": 1, "a": "ø"}
+    expected = hashlib.sha256('{"a":"ø","z":1}'.encode()).hexdigest()
+
+    assert fuse_record.canonical_json_digest(value) == expected
+    with pytest.raises(ValueError):
+        fuse_record.canonical_json_digest({"not_finite": float("nan")})
+
+
+def test_utc_timestamp_keeps_the_existing_iso8601_z_format() -> None:
+    stamp = fuse_record.utc_timestamp()
+
+    assert stamp.endswith("Z")
+    assert datetime.fromisoformat(
+        stamp.replace("Z", "+00:00")
+    ).utcoffset() == timedelta(0)
 
 
 def test_unknown_schema_version_fails_closed_without_migration() -> None:

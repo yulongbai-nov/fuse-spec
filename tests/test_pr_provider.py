@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from _support import git
 
 SCRIPT_DIR = Path(__file__).parents[1] / "skills" / "scripts"
 sys.path.insert(0, str(SCRIPT_DIR))
@@ -42,17 +43,6 @@ def strict_branch_rules(checks: tuple[str, ...] = ("tests",)) -> list[dict[str, 
             "active": True,
         },
     ]
-
-
-def git(root: Path, *arguments: str) -> str:
-    result = subprocess.run(
-        ["git", *arguments],
-        cwd=root,
-        capture_output=True,
-        check=True,
-        text=True,
-    )
-    return str(result.stdout.strip())
 
 
 def init_repo(tmp_path: Path) -> tuple[Path, Path, str]:

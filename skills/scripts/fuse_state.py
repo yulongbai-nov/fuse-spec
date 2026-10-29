@@ -11,17 +11,16 @@ import subprocess
 import tempfile
 import uuid
 from collections.abc import Mapping
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from fuse_record import new_run_record, validate_run_record
+    from fuse_record import new_run_record, utc_timestamp, validate_run_record
 else:
     try:
-        from .fuse_record import new_run_record, validate_run_record
+        from .fuse_record import new_run_record, utc_timestamp, validate_run_record
     except ImportError:
-        from fuse_record import new_run_record, validate_run_record
+        from fuse_record import new_run_record, utc_timestamp, validate_run_record
 
 SPEC_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 RUN_ID_RE = re.compile(r"^run_[0-9a-f]{32}$")
@@ -73,10 +72,6 @@ def _repository_root(repository_root: Path) -> Path:
     if not root.is_dir():
         raise StateError(f"repository root is not a directory: {root}")
     return root
-
-
-def _now() -> str:
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def run_record_path(repository_root: Path, run_id: str) -> Path:
@@ -449,7 +444,7 @@ def checkpoint_run(
         remote_record["git"]["state_revision"] if remote_record is not None else 0
     )
     candidate["git"]["state_revision"] = base_state_revision + 1
-    candidate["checkpointed_at"] = _now()
+    candidate["checkpointed_at"] = utc_timestamp()
     validate_run_record(candidate, previous=previous)
     if remote_record is not None:
         validate_run_record(candidate, previous=remote_record)

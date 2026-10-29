@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import builtins
 import copy
+import hashlib
 import json
 import shutil
 import subprocess
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from _support import git
 
 REPOSITORY = Path(__file__).parents[1]
 SCRIPT_DIR = REPOSITORY / "skills" / "scripts"
@@ -27,17 +29,6 @@ import fuse_launch  # noqa: E402
 import fuse_reconcile  # noqa: E402
 import fuse_record  # noqa: E402
 import fuse_state  # noqa: E402
-
-
-def git(root: Path, *args: str) -> str:
-    result = subprocess.run(
-        ["git", *args],
-        cwd=root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return result.stdout.strip()
 
 
 def make_project(tmp_path: Path, tasks: str | None = None) -> tuple[Path, Path]:
@@ -2745,6 +2736,13 @@ def test_review_replay_is_rejected_and_reopened_normalized_finding_keeps_id(
     )
     assert exhausted_rca.returncode != 0
     assert payload(exhausted_rca)["reason"] == "rca_limit_exhausted"
+
+
+def test_reconcile_record_digest_preserves_ascii_escaped_unicode() -> None:
+    record = {"label": "ø"}
+    payload = json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+    assert fuse_reconcile._record_digest(record) == hashlib.sha256(payload).hexdigest()
 
 
 def test_managed_reconcile_projects_checkboxes_from_validated_record_only(
