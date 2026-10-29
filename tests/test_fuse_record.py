@@ -26,7 +26,7 @@ def make_record() -> Any:
 
 def test_canonical_json_digest_preserves_unicode_and_rejects_nonfinite_values() -> None:
     value = {"z": 1, "a": "ø"}
-    expected = hashlib.sha256('{"a":"ø","z":1}'.encode("utf-8")).hexdigest()
+    expected = hashlib.sha256('{"a":"ø","z":1}'.encode()).hexdigest()
 
     assert fuse_record.canonical_json_digest(value) == expected
     with pytest.raises(ValueError):
