@@ -39,7 +39,7 @@ satisfies: R2, R4
 **Interface:**
 - Input: JSON-serializable values with optional serializer settings for a legacy snapshot digest, and requests for the current UTC timestamp.
 - Output: SHA-256 over the established canonical JSON representation, and UTC ISO-8601 strings ending in Z.
-- Dependencies: Python standard library; fuse_checks.py and fuse_state.py may import the helpers from fuse_record.py through the existing package/fallback import pattern.
+- Dependencies: Python standard library; fuse_checks.py, fuse_reconcile.py, and fuse_state.py may import the helpers from fuse_record.py through the existing package/fallback import pattern.
 
 **Notes:** Preserve json.dumps options exactly at each call site. The default digest settings are sort_keys, compact separators, ensure_ascii=False, and allow_nan=False; reconciliation explicitly retains its existing ensure_ascii=True and allow_nan=True behavior. Preserve datetime.now(UTC).isoformat().replace("+00:00", "Z"). Keep file-content hashing distinct from JSON canonicalization.
 
@@ -47,14 +47,14 @@ satisfies: R2, R4
 
 satisfies: R3, R4
 
-**Purpose:** Remove repeated Git wrapper and minimal candidate/check repository setup from the tests.
+**Purpose:** Remove repeated Git wrappers and minimal candidate/check repository setup from the tests.
 
 **Interface:**
 - Input: An existing temporary directory, a fixture option for required sample input, and a commit message.
 - Output: A rooted Git repository and spec directory with the standard minimal files.
 - Dependencies: pytest temp paths and Python standard library only.
 
-**Notes:** Existing test-specific remote, race, symlink, configuration, and source-tree fixtures remain local. The shared git helper uses cwd consistently and preserves checked text output.
+**Notes:** Existing test-specific remote, race, symlink, configuration, and source-tree fixtures remain local. The shared Git helper is used by candidate, check, state, PR, control, and verification tests; it uses cwd consistently and preserves checked text output.
 
 ## Testing Strategy
 

@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import importlib
 import json
-import subprocess
 import sys
 import tomllib
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from _support import git
 
 REPOSITORY = Path(__file__).parents[1]
 SCRIPT_DIR = REPOSITORY / "skills" / "scripts"
@@ -82,19 +82,11 @@ def make_repository(tmp_path: Path) -> tuple[Path, Path, dict[str, Any]]:
     (root / ".fuse" / "config.toml").write_text(
         config_prefix + "\n".join(check_sections), encoding="utf-8"
     )
-    subprocess.run(["git", "init", "--quiet", str(root)], check=True)
-    subprocess.run(
-        ["git", "-C", str(root), "config", "user.name", "Fuse test"], check=True
-    )
-    subprocess.run(
-        ["git", "-C", str(root), "config", "user.email", "fuse@example.invalid"],
-        check=True,
-    )
-    subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
-    subprocess.run(
-        ["git", "-C", str(root), "commit", "--quiet", "-m", "fixture"],
-        check=True,
-    )
+    git(root, "init", "--quiet")
+    git(root, "config", "user.name", "Fuse test")
+    git(root, "config", "user.email", "fuse@example.invalid")
+    git(root, "add", "-A")
+    git(root, "commit", "--quiet", "-m", "fixture")
     return root, spec, config
 
 
