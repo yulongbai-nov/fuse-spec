@@ -78,8 +78,31 @@ def _get_config_path(config: Mapping[str, Any], dotted_path: str) -> Any:
     return value
 
 
+def _nonfinite_float_paths(value: Any, path: str = "") -> list[str]:
+    if isinstance(value, float):
+        return [path or "<root>"] if not math.isfinite(value) else []
+    if isinstance(value, Mapping):
+        return [
+            nonfinite_path
+            for key, child in value.items()
+            for nonfinite_path in _nonfinite_float_paths(
+                child, f"{path}.{key}" if path else str(key)
+            )
+        ]
+    if isinstance(value, list):
+        return [
+            nonfinite_path
+            for index, child in enumerate(value)
+            for nonfinite_path in _nonfinite_float_paths(child, f"{path}[{index}]")
+        ]
+    return []
+
+
 def _semantic_errors(config: Mapping[str, Any]) -> list[str]:
-    errors: list[str] = []
+    errors = [
+        f"configuration value {path} must be finite"
+        for path in _nonfinite_float_paths(config)
+    ]
 
     roles = config["roles"]
     role_ids = set(roles)
@@ -163,9 +186,6 @@ def _semantic_errors(config: Mapping[str, Any]) -> list[str]:
             or not isinstance(current_value, (int, float))
         ):
             errors.append(f"override {field} must target a numeric configuration value")
-            continue
-        if isinstance(current_value, float) and not math.isfinite(current_value):
-            errors.append(f"configured value for {field} must be finite")
             continue
         if minimum is not None and current_value < minimum:
             errors.append(f"configured value for {field} is below its override minimum")

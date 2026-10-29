@@ -611,6 +611,41 @@ def test_overrides_reject_fractional_integer_and_nonfinite_values(
     assert "finite" in nonfinite.stderr.lower()
 
 
+def test_nonfinite_config_values_are_rejected_when_overrides_are_disabled(
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "consumer"
+    project_root.mkdir()
+    config_path = create_config(project_root)
+    replace_section_value(
+        config_path, "budgets.model_usage", 'limit = "unset"', "limit = nan"
+    )
+    content = config_path.read_text(encoding="utf-8")
+    content = content.replace(
+        "allowed_fields = [\n"
+        '    "limits.concurrency.ordinary_luna_max_floor",\n'
+        '    "limits.concurrency.other_profile_default",\n'
+        '    "limits.review.max_repair_rounds_per_level",\n'
+        '    "budgets.elapsed_time_seconds",\n'
+        '    "budgets.model_usage.limit",\n'
+        "]",
+        "allowed_fields = []",
+        1,
+    )
+    bounds_start = content.index("[overrides.bounds]")
+    toolchain_start = content.index("\n[toolchain]", bounds_start)
+    content = (
+        content[:bounds_start] + "[overrides.bounds]\n" + content[toolchain_start:]
+    )
+    config_path.write_text(content, encoding="utf-8")
+
+    result = run_config("validate", str(config_path))
+
+    assert result.returncode != 0
+    assert "budgets.model_usage.limit" in result.stderr
+    assert "finite" in result.stderr.lower()
+
+
 def test_effective_config_is_validated_after_overrides(tmp_path: Path) -> None:
     project_root = tmp_path / "consumer"
     project_root.mkdir()
