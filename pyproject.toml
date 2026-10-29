@@ -1,0 +1,40 @@
+[project]
+name = "fuse-spec"
+version = "0.1.0"
+description = "Spec-driven development workflow helpers"
+requires-python = ">=3.11"
+dependencies = ["jsonschema>=4.25,<5"]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.13,<2",
+    "pytest>=8.3,<10",
+    "ruff>=0.9,<1",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = [
+    "skills/scripts/plan_waves.py",
+    "skills/scripts/sync_check.py",
+    "tests",
+]
