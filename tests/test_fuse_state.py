@@ -11,20 +11,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _support import git
 
 SCRIPT_DIR = Path(__file__).parents[1] / "skills" / "scripts"
 sys.path.insert(0, str(SCRIPT_DIR))
 fuse_state: Any = importlib.import_module("fuse_state")
-
-
-def git(path: Path, *args: str) -> str:
-    result = subprocess.run(
-        ["git", "-C", str(path), *args],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return result.stdout.strip()
 
 
 def repository_with_bare_remote(tmp_path: Path) -> tuple[Path, Path]:

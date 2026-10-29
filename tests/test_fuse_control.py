@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from _support import git
 
 REPOSITORY = Path(__file__).parents[1]
 SCRIPT_DIR = REPOSITORY / "skills" / "scripts"
@@ -27,17 +28,6 @@ import fuse_launch  # noqa: E402
 import fuse_reconcile  # noqa: E402
 import fuse_record  # noqa: E402
 import fuse_state  # noqa: E402
-
-
-def git(root: Path, *args: str) -> str:
-    result = subprocess.run(
-        ["git", *args],
-        cwd=root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return result.stdout.strip()
 
 
 def make_project(tmp_path: Path, tasks: str | None = None) -> tuple[Path, Path]:
