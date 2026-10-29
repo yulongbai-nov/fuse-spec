@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
+import math
 import shutil
 import sys
 import tomllib
@@ -142,6 +144,7 @@ def _semantic_errors(config: Mapping[str, Any]) -> list[str]:
         field_bounds = bounds[field]
         minimum = field_bounds.get("minimum")
         maximum = field_bounds.get("maximum")
+        value_type = field_bounds["value_type"]
         if minimum is None and maximum is None:
             errors.append(f"override {field} must define a minimum or maximum bound")
             continue
@@ -150,10 +153,19 @@ def _semantic_errors(config: Mapping[str, Any]) -> list[str]:
             continue
         if current_value == "unset":
             continue
-        if isinstance(current_value, bool) or not isinstance(
-            current_value, (int, float)
+        if value_type == "integer" and type(current_value) is not int:
+            errors.append(
+                f"override {field} must target an integer configuration value"
+            )
+            continue
+        if value_type == "number" and (
+            isinstance(current_value, bool)
+            or not isinstance(current_value, (int, float))
         ):
             errors.append(f"override {field} must target a numeric configuration value")
+            continue
+        if isinstance(current_value, float) and not math.isfinite(current_value):
+            errors.append(f"configured value for {field} must be finite")
             continue
         if minimum is not None and current_value < minimum:
             errors.append(f"configured value for {field} is below its override minimum")
@@ -205,13 +217,31 @@ def validate_overrides(
             )
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ConfigError(f"override {field} must be numeric")
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ConfigError(f"override {field} must be finite")
         field_bounds = bounds[field]
+        value_type = field_bounds["value_type"]
+        if value_type == "integer" and type(value) is not int:
+            raise ConfigError(f"override {field} must be an integer")
         minimum = field_bounds.get("minimum")
         maximum = field_bounds.get("maximum")
         if minimum is not None and value < minimum:
             raise ConfigError(f"override {field} is below its configured bound")
         if maximum is not None and value > maximum:
             raise ConfigError(f"override {field} exceeds its configured bound")
+    effective_config = copy.deepcopy(dict(config))
+    for field, value in overrides.items():
+        path = field.split(".")
+        target: dict[str, Any] = effective_config
+        for part in path[:-1]:
+            nested = target.get(part)
+            if not isinstance(nested, dict):
+                raise ConfigError(
+                    f"override {field} does not name a configuration field"
+                )
+            target = nested
+        target[path[-1]] = value
+    validate_config(effective_config)
 
 
 def _require_project_file(root: Path, value: str, label: str) -> Path:
@@ -233,6 +263,39 @@ def _require_project_file(root: Path, value: str, label: str) -> Path:
             f"toolchain assessment/config required: {label} is not a file"
         )
     return path
+
+
+def _python_selector_satisfies(
+    selected_version: Version, constraint: SpecifierSet
+) -> bool:
+    """Check a uv major/minor selector against the stable patch versions it selects."""
+    release = selected_version.release
+    if (
+        len(release) != 2
+        or selected_version.is_prerelease
+        or selected_version.is_postrelease
+        or selected_version.is_devrelease
+        or selected_version.local is not None
+    ):
+        return constraint.contains(selected_version, prereleases=True)
+
+    major, minor = release
+    candidate_patches = {0}
+    for specifier in constraint:
+        boundary_text = specifier.version.removesuffix(".*")
+        try:
+            boundary = Version(boundary_text)
+        except InvalidVersion:
+            continue
+        if boundary.release[:2] != (major, minor):
+            continue
+        patch = boundary.release[2] if len(boundary.release) > 2 else 0
+        candidate_patches.update(max(0, patch + offset) for offset in (-1, 0, 1))
+
+    return any(
+        constraint.contains(Version(f"{major}.{minor}.{patch}"), prereleases=True)
+        for patch in candidate_patches
+    )
 
 
 def _validate_python_uv_stack(
@@ -263,14 +326,16 @@ def _validate_python_uv_stack(
             "must declare the same requires-python constraint"
         )
     try:
-        runtime_satisfies_manifest = SpecifierSet(manifest_constraint).contains(
-            Version(runtime_version), prereleases=True
-        )
+        constraint = SpecifierSet(manifest_constraint)
+        selected_version = Version(runtime_version)
     except (InvalidSpecifier, InvalidVersion) as error:
         raise ConfigError(
             "toolchain assessment/config required: Python runtime constraint is "
             f"invalid ({error})"
         ) from error
+    runtime_satisfies_manifest = _python_selector_satisfies(
+        selected_version, constraint
+    )
     if not runtime_satisfies_manifest:
         raise ConfigError(
             "toolchain assessment/config required: selected Python runtime does "
@@ -286,6 +351,18 @@ def _validate_python_uv_stack(
 
 
 def _validate_project_toolchain(root: Path, toolchain: Mapping[str, Any]) -> None:
+    package_manager = toolchain["package_manager"]
+    if shutil.which(package_manager) is None:
+        raise ConfigError(
+            "toolchain assessment/config required: selected package manager "
+            f"{package_manager!r} is unavailable"
+        )
+    if toolchain["runtime"] != "python" or package_manager != "uv":
+        raise ConfigError(
+            "toolchain assessment/config required: unsupported selected toolchain; "
+            "this initializer supports only Python with uv"
+        )
+
     runtime_file = _require_project_file(
         root, toolchain["runtime_file"], "runtime selection file"
     )
@@ -304,17 +381,25 @@ def _validate_project_toolchain(root: Path, toolchain: Mapping[str, Any]) -> Non
 
     manifest_path = _require_project_file(root, toolchain["manifest"], "manifest")
     lockfile_path = _require_project_file(root, toolchain["lockfile"], "lockfile")
-    package_manager = toolchain["package_manager"]
-    if shutil.which(package_manager) is None:
-        raise ConfigError(
-            "toolchain assessment/config required: selected package manager "
-            f"{package_manager!r} is unavailable"
-        )
+    _validate_python_uv_stack(
+        manifest_path, lockfile_path, toolchain["runtime_version"]
+    )
 
-    if toolchain["runtime"] == "python" and package_manager == "uv":
-        _validate_python_uv_stack(
-            manifest_path, lockfile_path, toolchain["runtime_version"]
-        )
+
+def _project_config_path(root: Path) -> Path:
+    candidate = root / ".fuse" / "config.toml"
+    try:
+        resolved = candidate.resolve(strict=False)
+        resolved.relative_to(root)
+    except RuntimeError as error:
+        raise ConfigError(
+            "project config destination cannot be safely resolved"
+        ) from error
+    except ValueError as error:
+        raise ConfigError(
+            "project config destination resolves outside the project"
+        ) from error
+    return resolved
 
 
 def initialize_config(project_root: Path, template_path: Path | None = None) -> bool:
@@ -322,7 +407,7 @@ def initialize_config(project_root: Path, template_path: Path | None = None) -> 
     root = project_root.expanduser().resolve()
     if not root.is_dir():
         raise ConfigError(f"project root is not a directory: {root}")
-    target = root / ".fuse" / "config.toml"
+    target = _project_config_path(root)
     if target.exists():
         existing = load_config(target)
         _validate_project_toolchain(root, existing["toolchain"])
@@ -333,10 +418,13 @@ def initialize_config(project_root: Path, template_path: Path | None = None) -> 
     _validate_project_toolchain(root, template["toolchain"])
     content = selected_template.read_text(encoding="utf-8")
     try:
+        target = _project_config_path(root)
         target.parent.mkdir(parents=True, exist_ok=True)
+        target = _project_config_path(root)
         with target.open("x", encoding="utf-8") as stream:
             stream.write(content)
     except FileExistsError:
+        target = _project_config_path(root)
         existing = load_config(target)
         _validate_project_toolchain(root, existing["toolchain"])
         return False
@@ -376,10 +464,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         if args.action == "init":
-            created = initialize_config(args.project_root, args.template)
-            config_path = (
-                args.project_root.expanduser().resolve() / ".fuse" / "config.toml"
-            )
+            project_root = args.project_root.expanduser().resolve()
+            created = initialize_config(project_root, args.template)
+            config_path = _project_config_path(project_root)
             config = load_config(config_path)
             result = {
                 "created": created,

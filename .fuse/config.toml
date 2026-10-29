@@ -62,11 +62,11 @@ allowed_fields = [
 ]
 
 [overrides.bounds]
-"limits.concurrency.ordinary_luna_max_floor" = { minimum = 1 }
-"limits.concurrency.other_profile_default" = { minimum = 1 }
-"limits.review.max_repair_rounds_per_level" = { minimum = 0, maximum = 2 }
-"budgets.elapsed_time_seconds" = { minimum = 1 }
-"budgets.model_usage.limit" = { minimum = 1 }
+"limits.concurrency.ordinary_luna_max_floor" = { minimum = 1, value_type = "integer" }
+"limits.concurrency.other_profile_default" = { minimum = 1, value_type = "integer" }
+"limits.review.max_repair_rounds_per_level" = { minimum = 0, maximum = 2, value_type = "integer" }
+"budgets.elapsed_time_seconds" = { minimum = 1, value_type = "integer" }
+"budgets.model_usage.limit" = { minimum = 1, value_type = "number" }
 
 [toolchain]
 runtime = "python"

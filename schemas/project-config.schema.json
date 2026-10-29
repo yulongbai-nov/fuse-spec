@@ -198,9 +198,11 @@
     },
     "numericBound": {
       "type": "object",
+      "required": ["value_type"],
       "properties": {
         "minimum": { "type": "integer", "minimum": 0 },
-        "maximum": { "type": "integer", "minimum": 0 }
+        "maximum": { "type": "integer", "minimum": 0 },
+        "value_type": { "enum": ["integer", "number"] }
       },
       "anyOf": [{ "required": ["minimum"] }, { "required": ["maximum"] }],
       "additionalProperties": false
