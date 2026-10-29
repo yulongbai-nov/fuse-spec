@@ -36,7 +36,7 @@ Priority: High
 
 **Acceptance Criteria:**
 
-1. WHEN a run record or check computes a canonical JSON digest THEN both SHALL use the same helper and retain the existing JSON options and SHA-256 output.
+1. WHEN record, check, or reconciliation code computes a JSON digest THEN it SHALL use the shared helper and retain that call site's existing serialization options and SHA-256 output.
 2. WHEN state and record code create a UTC timestamp THEN both SHALL use the same helper and retain the existing ISO-8601 UTC format ending in Z.
 3. WHEN candidates, check evidence, and persisted run records are created THEN their identities and serialized contracts SHALL remain unchanged for the same inputs.
 

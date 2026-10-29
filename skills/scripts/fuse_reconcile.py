@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import hashlib
 import json
 import os
 from collections.abc import Mapping, Sequence
@@ -46,8 +45,7 @@ class ReconcileError(RuntimeError):
 
 
 def _record_digest(record: Mapping[str, Any]) -> str:
-    payload = json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+    return fuse_record.canonical_json_digest(record, ensure_ascii=True, allow_nan=True)
 
 
 def _config(root: Path) -> dict[str, Any]:

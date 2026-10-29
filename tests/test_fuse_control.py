@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import builtins
 import copy
+import hashlib
 import json
 import shutil
 import subprocess
@@ -2735,6 +2736,13 @@ def test_review_replay_is_rejected_and_reopened_normalized_finding_keeps_id(
     )
     assert exhausted_rca.returncode != 0
     assert payload(exhausted_rca)["reason"] == "rca_limit_exhausted"
+
+
+def test_reconcile_record_digest_preserves_ascii_escaped_unicode() -> None:
+    record = {"label": "ø"}
+    payload = json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+    assert fuse_reconcile._record_digest(record) == hashlib.sha256(payload).hexdigest()
 
 
 def test_managed_reconcile_projects_checkboxes_from_validated_record_only(

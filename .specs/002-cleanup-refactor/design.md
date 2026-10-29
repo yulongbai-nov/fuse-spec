@@ -34,14 +34,14 @@ satisfies: R1
 
 satisfies: R2, R4
 
-**Purpose:** Let record creation, check evidence, and remote checkpoint code reuse canonical helpers without changing their contracts.
+**Purpose:** Let record creation, check evidence, reconciliation snapshots, and remote checkpoint code reuse shared digest and timestamp helpers without changing their contracts.
 
 **Interface:**
-- Input: JSON-serializable values and requests for the current UTC timestamp.
+- Input: JSON-serializable values with optional serializer settings for a legacy snapshot digest, and requests for the current UTC timestamp.
 - Output: SHA-256 over the established canonical JSON representation, and UTC ISO-8601 strings ending in Z.
 - Dependencies: Python standard library; fuse_checks.py and fuse_state.py may import the helpers from fuse_record.py through the existing package/fallback import pattern.
 
-**Notes:** Preserve json.dumps options exactly: sort_keys, compact separators, ensure_ascii=False, and allow_nan=False. Preserve datetime.now(UTC).isoformat().replace("+00:00", "Z"). Keep file-content hashing distinct from JSON canonicalization.
+**Notes:** Preserve json.dumps options exactly at each call site. The default digest settings are sort_keys, compact separators, ensure_ascii=False, and allow_nan=False; reconciliation explicitly retains its existing ensure_ascii=True and allow_nan=True behavior. Preserve datetime.now(UTC).isoformat().replace("+00:00", "Z"). Keep file-content hashing distinct from JSON canonicalization.
 
 ### D-TestSupport Shared test setup
 

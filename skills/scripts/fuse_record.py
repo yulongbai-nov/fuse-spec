@@ -47,14 +47,16 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
 
 
-def canonical_json_digest(value: Any) -> str:
+def canonical_json_digest(
+    value: Any, *, ensure_ascii: bool = False, allow_nan: bool = False
+) -> str:
     """Hash the canonical JSON representation shared by records and checks."""
     payload = json.dumps(
         value,
         sort_keys=True,
         separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
+        ensure_ascii=ensure_ascii,
+        allow_nan=allow_nan,
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
