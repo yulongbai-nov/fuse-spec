@@ -41,7 +41,7 @@
     - Test that code or policy changes invalidate affected evidence and that state-only or checkbox-only changes do not change the implementation candidate.
 
 - [ ] T5 Add the control CLI and validated transition/acceptance gates  [id:T5 deps:T3,T4 impl:R2,R3,R4,R5,R6,D-RunControl,D-Verification]
-    - **Files:** `skills/scripts/fuse_launch.py`, `skills/scripts/fuse_cli.py`, `skills/scripts/fuse_control.py`, `skills/scripts/fuse_record.py`, `skills/scripts/fuse_checks.py`, `skills/scripts/fuse_artifacts.py`, `skills/scripts/plan_waves.py`, `tests/test_fuse_control.py`, `tests/test_fuse_record.py`, `tests/test_plan_waves.py`
+    - **Files:** `skills/scripts/fuse_launch.py`, `skills/scripts/fuse_cli.py`, `skills/scripts/fuse_control.py`, `skills/scripts/fuse_record.py`, `skills/scripts/fuse_checks.py`, `skills/scripts/fuse_artifacts.py`, `skills/scripts/fuse_graph.py`, `skills/scripts/plan_waves.py`, `tests/test_fuse_control.py`, `tests/test_fuse_record.py`, `tests/test_plan_waves.py`
     - Add CLI scenario tests for inspect, initialize/resume, prepare-dispatch, bind-launch, record-result, accept, checkpoint, and reconcile operations, including invalid order, duplicate/late results, missing evidence, exhausted limits, and recovery from uncertain launch.
     - Require explicit absolute `--repo-root` and `--spec-dir` arguments at the CLI boundary. Run Git and project check subprocesses with the consuming repository root as their working directory, regardless of the Fuse plugin's launcher directory.
     - Implement a standard-library launcher that captures its starting directory, resolves the target root and spec path before invoking uv, and passes the absolute paths through to the CLI after uv changes to the plugin root.

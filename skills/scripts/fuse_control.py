@@ -312,10 +312,16 @@ def _independent_worker_task_count(
 def _dependencies_accepted(
     record: Mapping[str, Any], graph: Mapping[str, list[str]], task_id: str
 ) -> bool:
-    for dependency in graph[task_id]:
-        state = record["tasks"].get(dependency, {})
-        if state.get("status") != "accepted" or not state.get("accepted_candidate_id"):
+    accepted = set(fuse_graph.accepted_task_ids(record))
+    pending = list(graph[task_id])
+    visited: set[str] = set()
+    while pending:
+        dependency = pending.pop()
+        if dependency not in accepted:
             return False
+        if dependency not in visited:
+            visited.add(dependency)
+            pending.extend(graph[dependency])
     return True
 
 
@@ -414,20 +420,44 @@ def _implementation(
     return matches[-1] if matches else None
 
 
+def rca_review_attempt_ids(record: Mapping[str, Any], task_id: str) -> list[str]:
+    """Carry RCA review duties across later work, retries, and run restoration."""
+    required: list[str] = []
+    for assignment in _task_assignments(record, task_id):
+        if assignment["role_profile"] != "rca":
+            continue
+        for attempt in assignment["attempts"]:
+            if attempt["status"] not in fuse_record.TERMINAL_ATTEMPT_STATES:
+                continue
+            result = attempt.get("result", {})
+            baseline = result.get("rca_base_candidate_id")
+            candidate = result.get("rca_candidate_id")
+            # Older records cannot establish that RCA left the candidate intact.
+            if baseline is None or candidate is None or baseline != candidate:
+                required.append(str(attempt["id"]))
+    return required
+
+
 def _review_evidence(
     record: Mapping[str, Any],
     task_id: str,
     implementation_id: str,
     candidate_id: str,
     artifact_root: Path,
+    *,
+    role_profile: str = "reviewer",
+    required_rca_attempt_ids: Sequence[str] = (),
 ) -> Mapping[str, Any] | None:
     reviewer_ids = {
         item["id"]
         for item in _task_assignments(record, task_id)
-        if item["role_profile"] in REVIEW_ROLES
+        if item["role_profile"] == role_profile
         and item["id"] != implementation_id
         and item["status"] == "succeeded"
         and _latest(item)["status"] == "succeeded"
+        and set(required_rca_attempt_ids).issubset(
+            _latest(item).get("result", {}).get("rca_attempt_ids", [])
+        )
     }
     rows = [
         item
@@ -457,6 +487,12 @@ def _acceptance(
     graph = validate_spec_files(spec)
     if task_id not in graph:
         return _deny("unknown_task", f"task {task_id} is not declared in tasks.md")
+    if any(item["reservation_active"] for item in _task_assignments(record, task_id)):
+        return _deny(
+            "assignment_unresolved", "task acceptance requires resolved assignments"
+        )
+    if not _dependencies_accepted(record, graph, task_id):
+        return _deny("task_not_ready", "task dependencies are not currently accepted")
     state = record["tasks"].get(task_id)
     if isinstance(state, Mapping) and state["status"] == "accepted":
         return _deny("already_accepted", f"task {task_id} is already accepted")
@@ -517,6 +553,27 @@ def _acceptance(
             "candidate",
             candidate_id=current_id,
         )
+    rca_attempt_ids = rca_review_attempt_ids(record, task_id)
+    rca_review = None
+    if rca_attempt_ids:
+        rca_review = _review_evidence(
+            record,
+            task_id,
+            str(assignment["id"]),
+            current_id,
+            artifact_root,
+            role_profile="rca_reviewer",
+            required_rca_attempt_ids=rca_attempt_ids,
+        )
+        if rca_review is None:
+            return _deny(
+                "rca_review_evidence_missing",
+                "RCA changes require a separate configured RCA reviewer "
+                "for this candidate",
+                candidate_id=current_id,
+                rca_attempt_ids=rca_attempt_ids,
+                role_profile="rca_reviewer",
+            )
     unresolved = [
         item["id"]
         for item in record["findings"]
@@ -552,6 +609,7 @@ def _acceptance(
         assignment_id=assignment["id"],
         check_evidence_ids=check_ids,
         review_evidence_id=review["id"],
+        rca_review_evidence_id=rca_review["id"] if rca_review else None,
     )
 
 
@@ -688,6 +746,36 @@ def validate_transition(
                 return _deny(
                     "review_role_required", "Review requires a reviewer role profile"
                 )
+            check_findings = [
+                finding
+                for finding in task_findings
+                if finding["scope"].startswith("check:")
+            ]
+            if check_findings:
+                try:
+                    current_id = str(
+                        _candidate(
+                            current, root, _manifest(current, root, spec, config)
+                        )["candidate_id"]
+                    )
+                except ControlError as error:
+                    return _deny(error.reason, str(error), **error.details)
+                for finding in check_findings:
+                    check = str(finding["scope"])[len("check:") :]
+                    latest_check = fuse_record.latest_check_evidence(
+                        current, check, current_id
+                    )
+                    if latest_check is None or latest_check["outcome"] in {
+                        "unavailable",
+                        "inconclusive",
+                    }:
+                        return _deny(
+                            "check_execution_blocked",
+                            "obtain a current executable check result "
+                            "before code repair",
+                            check_id=check,
+                            finding_id=finding["id"],
+                        )
             if finding_id is not None and not any(
                 finding["id"] == finding_id for finding in task_findings
             ):
@@ -921,29 +1009,24 @@ def validate_transition(
             evidence is None
             or evidence["kind"] != "check"
             or evidence.get("check_id") != check_id
-            or evidence.get("outcome") not in {"pass", "fail"}
             or evidence.get("candidate_id") != current_id
         ):
             return _deny(
                 "check_evidence_invalid",
-                "check finding updates require current passing or failed evidence",
+                "check finding updates require evidence for the current candidate",
                 check_id=check_id,
                 candidate_id=current_id,
             )
-        latest_evidence = next(
-            item
-            for item in reversed(current["evidence"])
-            if item["kind"] == "check"
-            and item.get("check_id") == check_id
-            and item.get("candidate_id") == current_id
+        latest_evidence = fuse_record.latest_check_evidence(
+            current, check_id, current_id
         )
-        if latest_evidence["id"] != evidence_id:
+        if latest_evidence is None or latest_evidence["id"] != evidence_id:
             return _deny(
                 "check_evidence_superseded",
                 "a newer result supersedes this check evidence for the candidate",
                 check_id=check_id,
                 candidate_id=current_id,
-                latest_evidence_id=latest_evidence["id"],
+                latest_evidence_id=latest_evidence["id"] if latest_evidence else None,
             )
         return _allow(
             task_id=task_id,
@@ -1147,6 +1230,12 @@ def validate_transition(
                     "only an unresolved blocking finding for this task can be resolved",
                     finding_id=resolved_id,
                 )
+            if finding["scope"].startswith("check:"):
+                return _deny(
+                    "check_finding_requires_check_evidence",
+                    "check findings require a latest matching passing check",
+                    finding_id=resolved_id,
+                )
         return _allow(
             task_id=task_id,
             assignment_id=assignment_id,
@@ -1320,7 +1409,7 @@ def record_check_outcome(
     candidate_id: str,
     evidence_id: str,
 ) -> dict[str, Any] | None:
-    """Link a failed check to a task finding or resolve it on a matching pass."""
+    """Apply a shared check outcome without treating attribution as applicability."""
     decision = validate_transition(
         "record-check-outcome",
         repository_root=repository_root,
@@ -1336,23 +1425,29 @@ def record_check_outcome(
         raise ControlError(decision.reason, decision.message, decision.details)
     evidence = next(item for item in record["evidence"] if item["id"] == evidence_id)
     scope = f"check:{check_id}"
-    finding = next(
-        (
-            item
-            for item in record["findings"]
-            if item["task_id"] == task_id and item["scope"] == scope
-        ),
-        None,
-    )
-    if evidence["outcome"] == "fail":
-        state = record["tasks"].setdefault(
-            task_id,
-            {"status": "pending", "assignment_ids": [], "accepted_candidate_id": None},
-        )
-        state["accepted_candidate_id"] = None
-        if state["status"] == "accepted":
-            state["status"] = "blocked"
-        rationale = f"Check {check_id} failed: {evidence['summary']}"
+    findings = [item for item in record["findings"] if item["scope"] == scope]
+    finding = next((item for item in findings if item["task_id"] == task_id), None)
+    if evidence["outcome"] != "pass":
+        # Acceptance currently requires every configured check. Its evidence is
+        # shared by candidate/check, even when another task requested the rerun.
+        affected_tasks = {task_id} | {
+            accepted_task
+            for accepted_task, state in record["tasks"].items()
+            if state["accepted_candidate_id"] == candidate_id
+        }
+        for affected_task in sorted(affected_tasks):
+            state = record["tasks"].setdefault(
+                affected_task,
+                {
+                    "status": "pending",
+                    "assignment_ids": [],
+                    "accepted_candidate_id": None,
+                },
+            )
+            state["accepted_candidate_id"] = None
+            if state["status"] == "accepted":
+                state["status"] = "blocked"
+        rationale = f"Check {check_id} {evidence['outcome']}: {evidence['summary']}"
         if finding is None:
             finding = fuse_record.add_finding(
                 record,
@@ -1366,32 +1461,30 @@ def record_check_outcome(
                 record, finding["id"], evidence_id, rationale
             )
         return finding
-    if (
-        finding is not None
-        and finding["blocking"]
-        and finding["status"]
-        in {
+    for check_finding in findings:
+        if check_finding["blocking"] and check_finding["status"] in {
             "open",
             "deferred",
-        }
-    ):
-        finding = fuse_record.resolve_check_finding(
-            record,
-            finding["id"],
-            task_id,
-            check_id,
-            candidate_id,
-            evidence_id,
-        )
-        state = record["tasks"][task_id]
+        }:
+            fuse_record.resolve_check_finding(
+                record,
+                check_finding["id"],
+                check_finding["task_id"],
+                check_id,
+                candidate_id,
+                evidence_id,
+            )
+    for affected_task, state in record["tasks"].items():
         if state["status"] == "blocked" and not any(
-            item["task_id"] == task_id
+            item["task_id"] == affected_task
             and item["blocking"]
             and item["status"] in {"open", "deferred"}
             for item in record["findings"]
         ):
+            # This is not acceptance: all current checks/reviews must still pass
+            # the explicit accept gate before any dependent task is released.
             state["status"] = "in_progress"
-        fuse_record.validate_run_record(record)
+    fuse_record.validate_run_record(record)
     return finding
 
 

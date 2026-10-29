@@ -18,6 +18,12 @@ from jsonschema.exceptions import SchemaError, ValidationError
 SCHEMA_VERSION = 1
 TERMINAL_ATTEMPT_STATES = {"succeeded", "failed", "cancelled"}
 RESERVED_ATTEMPT_STATES = {"prepared", "launched", "unknown"}
+DISPATCH_CONTEXT_FIELDS = (
+    "candidate_id",
+    "finding_id",
+    "rca_base_candidate_id",
+    "rca_attempt_ids",
+)
 
 
 class RecordError(ValueError):
@@ -131,12 +137,20 @@ def _semantic_errors(record: Mapping[str, Any]) -> list[str]:
                 host_handles.add(host_handle)
             result = attempt.get("result", {})
             if isinstance(result, Mapping):
-                candidate_id = result.get("candidate_id")
-                if candidate_id is not None and candidate_id not in candidate_ids:
-                    errors.append(
-                        f"attempt {attempt_id} references unknown candidate "
-                        f"{candidate_id}"
-                    )
+                for field in (
+                    "candidate_id",
+                    "rca_base_candidate_id",
+                    "rca_candidate_id",
+                ):
+                    candidate_id = result.get(field)
+                    if candidate_id is not None and (
+                        not isinstance(candidate_id, str)
+                        or candidate_id not in candidate_ids
+                    ):
+                        errors.append(
+                            f"attempt {attempt_id} references unknown candidate "
+                            f"{candidate_id}"
+                        )
                 finding_id = result.get("finding_id")
                 if finding_id is not None and finding_id not in finding_ids:
                     errors.append(
@@ -144,6 +158,27 @@ def _semantic_errors(record: Mapping[str, Any]) -> list[str]:
                     )
 
     task_assignment_ids: set[str] = set()
+    rca_attempt_ids = {
+        attempt["id"]
+        for assignment in assignments
+        if assignment["role_profile"] == "rca"
+        for attempt in assignment["attempts"]
+    }
+    for assignment in assignments:
+        for attempt in assignment["attempts"]:
+            references = attempt.get("result", {}).get("rca_attempt_ids", [])
+            if (
+                not isinstance(references, list)
+                or any(
+                    not isinstance(item, str) or item not in rca_attempt_ids
+                    for item in references
+                )
+                or len(references) != len(set(references))
+            ):
+                errors.append(
+                    "RCA review context must reference unique RCA attempt IDs"
+                )
+
     for task_id, task_state in tasks.items():
         for assignment_id in task_state["assignment_ids"]:
             if assignment_id not in assignment_ids:
@@ -294,7 +329,7 @@ def _validate_history(previous: Mapping[str, Any], current: Mapping[str, Any]) -
         for old_attempt, new_attempt in zip(old_attempts, new_attempts):
             old_result = old_attempt.get("result", {})
             new_result = new_attempt.get("result", {})
-            for field in ("candidate_id", "finding_id"):
+            for field in DISPATCH_CONTEXT_FIELDS:
                 if (
                     isinstance(old_result, Mapping)
                     and field in old_result
@@ -473,6 +508,8 @@ def prepare_assignment(
     capacity: int = 1,
     review_candidate_id: str | None = None,
     finding_id: str | None = None,
+    rca_base_candidate_id: str | None = None,
+    rca_attempt_ids: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Persist an assignment and reserve capacity before any host launch."""
     if any(
@@ -498,6 +535,14 @@ def prepare_assignment(
         if finding_id not in {item["id"] for item in record["findings"]}:
             raise RecordError("dispatch finding does not exist")
         dispatch_context["finding_id"] = finding_id
+    if rca_base_candidate_id is not None:
+        if role_profile != "rca" or rca_base_candidate_id not in {
+            item["candidate_id"] for item in record["candidates"]
+        }:
+            raise RecordError("RCA dispatch requires a persisted baseline candidate")
+        dispatch_context["rca_base_candidate_id"] = rca_base_candidate_id
+    if role_profile == "rca_reviewer":
+        dispatch_context["rca_attempt_ids"] = list(rca_attempt_ids)
     if dispatch_context:
         attempt["result"] = dispatch_context
     assignment = {
@@ -591,7 +636,7 @@ def record_attempt_result(
         raise RecordError("attempt dispatch context must be an object")
     result_data = copy.deepcopy(dict(existing_result))
     for key, value in (result or {}).items():
-        if key in {"candidate_id", "finding_id"} and key in result_data:
+        if key in DISPATCH_CONTEXT_FIELDS and key in result_data:
             if result_data[key] != value:
                 raise RecordError(f"attempt {key} cannot change after dispatch")
         result_data[key] = copy.deepcopy(value)
@@ -639,6 +684,9 @@ def append_retry(record: dict[str, Any], assignment_id: str) -> dict[str, Any]:
             dispatch_context["candidate_id"] = latest_result["candidate_id"]
         if "finding_id" in latest_result:
             dispatch_context["finding_id"] = latest_result["finding_id"]
+        for field in ("rca_base_candidate_id", "rca_attempt_ids"):
+            if field in latest_result:
+                dispatch_context[field] = copy.deepcopy(latest_result[field])
     if dispatch_context:
         attempt["result"] = copy.deepcopy(dispatch_context)
     assignment["attempts"].append(attempt)
@@ -775,6 +823,22 @@ def append_finding_evidence(
     return cast(dict[str, Any], finding)
 
 
+def latest_check_evidence(
+    record: Mapping[str, Any], check_id: str, candidate_id: str
+) -> Mapping[str, Any] | None:
+    """Use append order, including unavailable/inconclusive check outcomes."""
+    return next(
+        (
+            item
+            for item in reversed(record["evidence"])
+            if item["kind"] == "check"
+            and item.get("check_id") == check_id
+            and item["candidate_id"] == candidate_id
+        ),
+        None,
+    )
+
+
 def resolve_check_finding(
     record: dict[str, Any],
     finding_id: str,
@@ -796,11 +860,10 @@ def resolve_check_finding(
         or finding["status"] not in {"open", "deferred"}
     ):
         raise RecordError("check resolution does not match an open task finding")
-    evidence = next(
-        (item for item in record["evidence"] if item["id"] == evidence_id), None
-    )
+    evidence = latest_check_evidence(record, check_id, candidate_id)
     if (
         evidence is None
+        or evidence["id"] != evidence_id
         or evidence["kind"] != "check"
         or evidence.get("check_id") != check_id
         or evidence["outcome"] != "pass"
@@ -836,6 +899,10 @@ def resolve_finding(
     )
     if finding is None:
         raise RecordError(f"unknown finding {finding_id}")
+    if finding["scope"].startswith("check:"):
+        raise RecordError(
+            "check findings require latest matching passing check evidence"
+        )
     if not finding["blocking"] or finding["status"] not in {"open", "deferred"}:
         raise RecordError(f"finding {finding_id} is not unresolved")
     if not rationale.strip():

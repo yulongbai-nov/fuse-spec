@@ -244,6 +244,387 @@ def submit_review(
     return run_cli(root, spec_dir, "record-review", *arguments)
 
 
+class GateScenario:
+    """Exercise persisted control transitions with real check commands."""
+
+    def __init__(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        self.root, self.spec = make_project(
+            tmp_path,
+            "# Tasks\n\n"
+            "- [ ] T1 Work [id:T1 deps: impl:R1,D-Test]\n"
+            "- [ ] T2 Dependent [id:T2 deps:T1 impl:R1,D-Test]\n"
+            "- [ ] T3 Independent [id:T3 deps: impl:R1,D-Test]\n"
+            "- [ ] T4 Independent [id:T4 deps: impl:R1,D-Test]\n",
+        )
+        self.monkeypatch = monkeypatch
+        self.capsys = capsys
+        self.check_outcome = "pass"
+        config_path = self.root / ".fuse" / "config.toml"
+        prefix = config_path.read_text().split("[checks.pytest]", 1)[0]
+        command = [
+            sys.executable,
+            "-c",
+            "import os; raise SystemExit(int(os.environ['FUSE_TEST_CHECK_EXIT']))",
+        ]
+        config_path.write_text(
+            prefix
+            + "[checks.smoke]\n"
+            + f"command = {json.dumps(command)}\n"
+            + "prerequisites = []\n"
+            + 'inputs = ["app.py"]\n'
+            + 'pass_criteria = "exit_code == 0"\n',
+            encoding="utf-8",
+        )
+        self.config = fuse_config.load_config(config_path)
+        self.run_id = initialized_run(self.root, self.spec)
+        self.report = tmp_path / "review.md"
+        self.report.write_text("Independent current-candidate review.\n")
+        monkeypatch.setattr(fuse_checks, "prepare_toolchain", self.prepare_toolchain)
+
+    def prepare_toolchain(self, root: Path, _config: Any) -> dict[str, Any]:
+        if self.check_outcome == "inconclusive":
+            (root / "app.py").write_text("changed during preparation\n")
+        return {
+            "ready": self.check_outcome != "unavailable",
+            "summary": "test environment",
+            "tool_versions": {"python": "3.11"},
+        }
+
+    def record(self) -> dict[str, Any]:
+        return fuse_state.load_run(self.root, self.run_id)
+
+    def call(
+        self, operation: str, *arguments: str, allowed: bool = True
+    ) -> dict[str, Any]:
+        status = fuse_cli.main(
+            [
+                operation,
+                "--repo-root",
+                str(self.root),
+                "--spec-dir",
+                str(self.spec),
+                "--run-id",
+                self.run_id,
+                *arguments,
+            ]
+        )
+        result = cast(dict[str, Any], json.loads(self.capsys.readouterr().out))
+        assert (status == 0) is allowed, result
+        return result
+
+    def start(
+        self, role: str, *, finding_id: str | None = None, task_id: str = "T1"
+    ) -> dict[str, Any]:
+        args = ["--task-id", task_id, "--role-profile", role, "--method"]
+        args.append("Review" if role in fuse_control.REVIEW_ROLES else "Bug Fix")
+        if role == "worker" and finding_id is None:
+            args[-1] = "Feature"
+        if finding_id is not None:
+            args.extend(("--finding-id", finding_id))
+        assignment = self.call("prepare-dispatch", *args)
+        self.call(
+            "bind-launch",
+            "--assignment-id",
+            assignment["assignment_id"],
+            "--attempt-id",
+            assignment["attempt_id"],
+            "--host-handle",
+            assignment["assignment_id"],
+        )
+        return assignment
+
+    def finish(self, assignment: dict[str, Any], outcome: str = "succeeded") -> None:
+        self.call(
+            "record-result",
+            "--assignment-id",
+            assignment["assignment_id"],
+            "--attempt-id",
+            assignment["attempt_id"],
+            "--outcome",
+            outcome,
+        )
+
+    def check(self, outcome: str = "pass", task_id: str = "T1") -> dict[str, Any]:
+        self.check_outcome = outcome
+        self.monkeypatch.setenv(
+            "FUSE_TEST_CHECK_EXIT", "1" if outcome == "fail" else "0"
+        )
+        result = self.call("run-check", "--task-id", task_id, "--check-id", "smoke")
+        assert result["outcome"] == outcome
+        return result
+
+    def review(self, role: str = "reviewer", *, resolve: str | None = None) -> None:
+        reviewer = self.start(role)
+        self.finish(reviewer)
+        args = [
+            "--task-id",
+            "T1",
+            "--assignment-id",
+            reviewer["assignment_id"],
+            "--candidate-id",
+            reviewer["candidate_id"],
+            "--outcome",
+            "pass",
+            "--summary",
+            "Current candidate reviewed",
+            "--report",
+            str(self.report),
+        ]
+        if resolve is not None:
+            args.extend(
+                ("--resolve-finding-id", resolve, "--resolution-rationale", "verified")
+            )
+        self.call("record-review", *args)
+
+    def accepted(self) -> None:
+        self.finish(self.start("worker"))
+        self.check()
+        self.review()
+        self.call("accept", "--task-id", "T1")
+
+
+@pytest.fixture
+def gate_scenario(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> GateScenario:
+    return GateScenario(tmp_path, monkeypatch, capsys)
+
+
+@pytest.mark.parametrize("outcome", ["unavailable", "inconclusive"])
+def test_nonpassing_rerun_revokes_acceptance_without_authorizing_code_repair(
+    gate_scenario: GateScenario, outcome: str
+) -> None:
+    """RCA finding 1: environment/evidence blockers cannot release dependents."""
+    scenario = gate_scenario
+    scenario.accepted()
+    before = scenario.record()
+    scenario.check(outcome)
+    record = scenario.record()
+    assert record["tasks"]["T1"]["accepted_candidate_id"] is None
+    assert scenario.call("inspect")["eligible_task_ids"] == ["T3", "T4"]
+    blocked = scenario.call(
+        "prepare-dispatch",
+        "--task-id",
+        "T1",
+        "--method",
+        "Bug Fix",
+        "--role-profile",
+        "worker",
+        allowed=False,
+    )
+    assert blocked["reason"] == "check_execution_blocked"
+    finding_id = record["findings"][0]["id"]
+    scenario.call(
+        "prepare-dispatch",
+        "--task-id",
+        "T1",
+        "--method",
+        "Bug Fix",
+        "--role-profile",
+        "rca",
+        "--finding-id",
+        finding_id,
+        allowed=False,
+    )
+    scenario.check()
+    assert scenario.call("inspect")["eligible_task_ids"] == ["T3", "T4"]
+    scenario.call("accept", "--task-id", "T1")
+    assert scenario.call("inspect")["eligible_task_ids"] == ["T2", "T3", "T4"]
+    assert scenario.record()["assignments"] == before["assignments"]
+    assert scenario.record()["rca_attempts"] == before["rca_attempts"]
+
+
+def test_shared_check_failure_invalidates_other_accepted_tasks(
+    gate_scenario: GateScenario,
+) -> None:
+    """RCA finding 2: attribution cannot restrict shared check invalidation."""
+    scenario = gate_scenario
+    scenario.accepted()
+    scenario.check("fail", "T3")
+    assert scenario.record()["tasks"]["T1"]["accepted_candidate_id"] is None
+    scenario.call(
+        "prepare-dispatch",
+        "--task-id",
+        "T2",
+        "--method",
+        "Feature",
+        "--role-profile",
+        "worker",
+        allowed=False,
+    )
+    assert "T4" in scenario.call("inspect")["eligible_task_ids"]
+    finding_id = scenario.record()["findings"][0]["id"]
+    scenario.check("fail", "T1")
+    findings = {item["task_id"]: item for item in scenario.record()["findings"]}
+    assert set(findings) == {"T1", "T3"}
+    assert findings["T3"]["id"] == finding_id
+    scenario.check("pass", "T3")
+    assert "T2" not in scenario.call("inspect")["eligible_task_ids"]
+    scenario.call("accept", "--task-id", "T1")
+    assert "T2" in scenario.call("inspect")["eligible_task_ids"]
+
+
+def test_sequential_shared_check_failures_preserve_each_tasks_repair_route(
+    gate_scenario: GateScenario,
+) -> None:
+    """Finding 2 retains task-bound repairs while sharing passing check evidence."""
+    scenario = gate_scenario
+    for task_id in ("T1", "T3"):
+        scenario.finish(scenario.start("worker", task_id=task_id))
+    first_failure = scenario.check("fail", "T1")
+    second_failure = scenario.check("fail", "T3")
+    findings = {item["task_id"]: item for item in scenario.record()["findings"]}
+    assert set(findings) == {"T1", "T3"}
+    assert findings["T1"]["evidence_ids"] == [first_failure["evidence_id"]]
+    assert findings["T3"]["evidence_ids"] == [second_failure["evidence_id"]]
+    for task_id, finding in findings.items():
+        scenario.finish(
+            scenario.start("worker", finding_id=finding["id"], task_id=task_id)
+        )
+    repeated_failure = scenario.check("fail", "T3")
+    before_pass = scenario.record()
+    assert [item["id"] for item in before_pass["findings"]] == [
+        findings["T1"]["id"],
+        findings["T3"]["id"],
+    ]
+    assert before_pass["findings"][1]["evidence_ids"] == [
+        second_failure["evidence_id"],
+        repeated_failure["evidence_id"],
+    ]
+    assert before_pass["review_counters"] == [
+        {"scope_id": task_id, "level": "task", "repairs_used": 1, "limit": 2}
+        for task_id in ("T1", "T3")
+    ]
+    passed = scenario.check("pass", "T1")
+    after_pass = scenario.record()
+    assert all(item["status"] == "resolved" for item in after_pass["findings"])
+    assert all(
+        item["history"][-1]["evidence_ids"] == [passed["evidence_id"]]
+        for item in after_pass["findings"]
+    )
+    assert after_pass["review_counters"] == before_pass["review_counters"]
+    assert after_pass["rca_attempts"] == before_pass["rca_attempts"]
+
+
+def test_unresolved_review_reservation_blocks_acceptance_and_readiness(
+    gate_scenario: GateScenario,
+) -> None:
+    """RCA finding 3: an unknown launch must outrank recorded acceptance."""
+    scenario = gate_scenario
+    scenario.accepted()
+    reviewer = scenario.start("reviewer")
+    scenario.finish(reviewer, "unknown")
+    refused = scenario.call("accept", "--task-id", "T1", allowed=False)
+    assert refused["reason"] == "assignment_unresolved"
+    record = scenario.record()
+    record["tasks"]["T1"]["status"] = "accepted"
+    fuse_state.save_run(scenario.root, record)
+    inspected = scenario.call("inspect")
+    assert "T1" not in inspected["accepted_task_ids"]
+    assert "T2" not in inspected["eligible_task_ids"]
+    scenario.finish(reviewer, "failed")
+    scenario.call("accept", "--task-id", "T1")
+    assert "T2" in scenario.call("inspect")["eligible_task_ids"]
+
+
+def test_rca_fix_requires_separate_rca_review_after_later_worker_changes(
+    gate_scenario: GateScenario,
+) -> None:
+    """RCA finding 4: later ordinary work cannot erase the RCA review duty."""
+    scenario = gate_scenario
+    scenario.finish(scenario.start("worker"))
+    record = scenario.record()
+    finding = fuse_record.add_finding(record, "T1", "Hard blocker")
+    fuse_record.reserve_task_repair(record, "T1", limit=2)
+    fuse_state.save_run(scenario.root, record)
+    rca = scenario.start("rca", finding_id=finding["id"])
+    (scenario.root / "app.py").write_text("value = 2\n")
+    scenario.finish(rca)
+    worker = scenario.start("worker", finding_id=finding["id"])
+    (scenario.root / "app.py").write_text("value = 3\n")
+    scenario.finish(worker)
+    scenario.check()
+    scenario.review(resolve=finding["id"])
+    refused = scenario.call("accept", "--task-id", "T1", allowed=False)
+    assert refused["reason"] == "rca_review_evidence_missing"
+    counters = scenario.record()["review_counters"]
+    rca_counters = scenario.record()["rca_attempts"]
+    scenario.review("rca_reviewer")
+    scenario.call("accept", "--task-id", "T1")
+    record = scenario.record()
+    assert record["review_counters"] == counters
+    assert record["rca_attempts"] == rca_counters
+    assert record["review_counters"][0]["repairs_used"] == 2
+
+
+@pytest.mark.parametrize("changes_candidate", [False, True])
+def test_rca_review_is_additional_and_unchanged_rca_does_not_create_obligation(
+    gate_scenario: GateScenario, changes_candidate: bool
+) -> None:
+    scenario = gate_scenario
+    scenario.finish(scenario.start("worker"))
+    record = scenario.record()
+    finding = fuse_record.add_finding(record, "T1", "Investigate a hard blocker")
+    fuse_state.save_run(scenario.root, record)
+    rca = scenario.start("rca", finding_id=finding["id"])
+    if changes_candidate:
+        (scenario.root / "app.py").write_text("value = 2\n")
+    scenario.finish(rca)
+    scenario.check()
+    if changes_candidate:
+        scenario.review("rca_reviewer", resolve=finding["id"])
+        refused = scenario.call("accept", "--task-id", "T1", allowed=False)
+        assert refused["reason"] == "review_evidence_missing"
+        scenario.review()
+    else:
+        scenario.review(resolve=finding["id"])
+        assert fuse_control.rca_review_attempt_ids(scenario.record(), "T1") == []
+    scenario.call("accept", "--task-id", "T1")
+    assert scenario.record()["rca_attempts"][0]["attempts_used"] == 1
+
+
+def test_review_cannot_resolve_executable_check_finding(
+    gate_scenario: GateScenario,
+) -> None:
+    """RCA finding 5: reviewer prose cannot clear a failed executable check."""
+    scenario = gate_scenario
+    scenario.finish(scenario.start("worker"))
+    scenario.check("fail")
+    finding_id = scenario.record()["findings"][0]["id"]
+    reviewer = scenario.start("reviewer")
+    scenario.finish(reviewer)
+    before = scenario.record()
+    rejected = scenario.call(
+        "record-review",
+        "--task-id",
+        "T1",
+        "--assignment-id",
+        reviewer["assignment_id"],
+        "--candidate-id",
+        reviewer["candidate_id"],
+        "--outcome",
+        "pass",
+        "--summary",
+        "Reviewer says fixed",
+        "--report",
+        str(scenario.report),
+        "--resolve-finding-id",
+        finding_id,
+        "--resolution-rationale",
+        "looks fine",
+        allowed=False,
+    )
+    assert rejected["reason"] == "check_finding_requires_check_evidence"
+    assert scenario.record() == before
+    scenario.check()
+    assert scenario.record()["findings"][0]["status"] == "resolved"
+
+
 def test_cli_requires_absolute_roots_and_returns_machine_reason(tmp_path: Path) -> None:
     root, spec_dir = make_project(tmp_path)
     result = subprocess.run(
@@ -1398,14 +1779,15 @@ def test_failed_check_retries_reuse_task_finding_and_rca_allowance(
     assert unavailable_result["outcome"] == "unavailable"
     record = fuse_state.load_run(root, run_id)
     assert record["evidence"][-1]["outcome"] == "unavailable"
-    assert record["findings"] == []
+    assert len(record["findings"]) == 1
+    initial_finding_id = record["findings"][0]["id"]
 
     preparation_state["mode"] = "inconclusive"
     inconclusive_result = run_check(candidate["candidate_id"])
     assert inconclusive_result["outcome"] == "inconclusive"
     record = fuse_state.load_run(root, run_id)
     assert record["evidence"][-1]["outcome"] == "inconclusive"
-    assert record["findings"] == []
+    assert [item["id"] for item in record["findings"]] == [initial_finding_id]
 
     preparation_state["mode"] = "ready"
     first_result = run_check(candidate["candidate_id"])
@@ -1417,7 +1799,12 @@ def test_failed_check_retries_reuse_task_finding_and_rca_allowance(
     first_evidence_id = first_result["evidence_id"]
     assert finding["scope"] == "check:smoke"
     assert finding["task_id"] == "T1"
-    assert finding["evidence_ids"] == [first_evidence_id]
+    prior_evidence_ids = [
+        unavailable_result["evidence_id"],
+        inconclusive_result["evidence_id"],
+        first_evidence_id,
+    ]
+    assert finding["evidence_ids"] == prior_evidence_ids
 
     repair = run_cli(
         root,
@@ -1532,8 +1919,11 @@ def test_failed_check_retries_reuse_task_finding_and_rca_allowance(
     assert len(record["findings"]) == 1
     finding = record["findings"][0]
     assert finding["id"] == finding_id
-    assert finding["evidence_ids"] == [first_evidence_id, second_result["evidence_id"]]
-    assert len(finding["history"]) == 2
+    assert finding["evidence_ids"] == [
+        *prior_evidence_ids,
+        second_result["evidence_id"],
+    ]
+    assert len(finding["history"]) == 4
     assert finding["history"][-1]["action"] == "confirmed"
     assert record["rca_attempts"] == [
         {"finding_id": finding_id, "attempts_used": 1, "limit": 1}

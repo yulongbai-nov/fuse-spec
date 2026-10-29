@@ -322,11 +322,7 @@ def _inspect(
         record_path=_record_path(root, record),
         eligible_task_ids=fuse_graph.ready_task_ids(graph, record),
         unresolved_launches=fuse_control.unresolved_launches(record),
-        accepted_task_ids=sorted(
-            task_id
-            for task_id, state in record["tasks"].items()
-            if state["status"] == "accepted" and state["accepted_candidate_id"]
-        ),
+        accepted_task_ids=fuse_graph.accepted_task_ids(record),
     )
 
 
@@ -452,6 +448,7 @@ def _prepare(
             error.details["record_path"] = _record_path(root, record)
         raise
     review_candidate_id: str | None = None
+    rca_base_candidate_id: str | None = None
     if args.role_profile in fuse_control.REVIEW_ROLES:
         candidate = fuse_control.current_candidate(record, root, spec, config)
         if candidate["candidate_id"] != decision.details["candidate_id"]:
@@ -460,6 +457,10 @@ def _prepare(
                 "review candidate changed while reserving the assignment",
             )
         review_candidate_id = candidate["candidate_id"]
+    elif args.role_profile == "rca":
+        rca_base_candidate_id = fuse_control.current_candidate(
+            record, root, spec, config
+        )["candidate_id"]
     assignment = fuse_record.prepare_assignment(
         record,
         args.task_id,
@@ -468,6 +469,12 @@ def _prepare(
         capacity=int(decision.details["reserved_capacity"]),
         review_candidate_id=review_candidate_id,
         finding_id=args.finding_id,
+        rca_base_candidate_id=rca_base_candidate_id,
+        rca_attempt_ids=(
+            fuse_control.rca_review_attempt_ids(record, args.task_id)
+            if args.role_profile == "rca_reviewer"
+            else ()
+        ),
     )
     repair_kind = decision.details.get("repair_kind")
     if repair_kind == "task":
@@ -547,6 +554,16 @@ def _record_result(
     result_data: dict[str, Any] = {"summary": args.summary}
     if args.candidate_id:
         result_data["candidate_id"] = args.candidate_id
+    assignment = next(
+        item for item in record["assignments"] if item["id"] == args.assignment_id
+    )
+    if (
+        assignment["role_profile"] == "rca"
+        and args.outcome in fuse_record.TERMINAL_ATTEMPT_STATES
+    ):
+        result_data["rca_candidate_id"] = fuse_control.current_candidate(
+            record, root, spec, config
+        )["candidate_id"]
     fuse_record.record_attempt_result(
         record,
         args.assignment_id,
@@ -592,17 +609,16 @@ def _run_check(
         result = fuse_checks.run_check(
             root, spec, config, record, candidate["candidate_id"], args.check_id
         )
-        if result["outcome"] in {"pass", "fail"}:
-            fuse_control.record_check_outcome(
-                record,
-                root,
-                spec,
-                config,
-                args.task_id,
-                args.check_id,
-                candidate["candidate_id"],
-                result["evidence_id"],
-            )
+        fuse_control.record_check_outcome(
+            record,
+            root,
+            spec,
+            config,
+            args.task_id,
+            args.check_id,
+            candidate["candidate_id"],
+            result["evidence_id"],
+        )
     finally:
         if len(record["evidence"]) != before:
             _save(root, record)

@@ -149,8 +149,8 @@ def _ready_nodes(
     blocked: Iterable[str] = (),
 ) -> list[str]:
     """Advance only completed nodes, leaving blocked paths closed."""
-    completed_set = set(completed)
     blocked_set = set(blocked)
+    completed_set = set(completed) - blocked_set
     sorter = TopologicalSorter(graph)
     sorter.prepare()
     ready: list[str] = []
@@ -167,6 +167,22 @@ def _ready_nodes(
         if releasable:
             sorter.done(*releasable)
     return sorted(ready)
+
+
+def accepted_task_ids(run_record: Mapping[str, Any]) -> list[str]:
+    """Return acceptance that is not suspended by an unresolved reservation."""
+    active = {
+        assignment.get("task_id")
+        for assignment in run_record.get("assignments", ())
+        if assignment.get("reservation_active") is True
+    }
+    return sorted(
+        task_id
+        for task_id, state in run_record.get("tasks", {}).items()
+        if state.get("status") == "accepted"
+        and state.get("accepted_candidate_id")
+        and task_id not in active
+    )
 
 
 def ready_task_ids(
@@ -188,14 +204,18 @@ def ready_task_ids(
         for assignment in run_record.get("assignments", ())
         if assignment.get("reservation_active") is True
     }
-    accepted: set[str] = set()
+    accepted = set(accepted_task_ids(run_record))
     blocked: set[str] = set()
     for task_id in graph:
         state = task_states.get(task_id, {})
         status = state.get("status", "pending")
-        if status == "accepted" and state.get("accepted_candidate_id"):
-            accepted.add(task_id)
-        elif status in {"blocked", "cancelled", "assigned", "in_progress", "accepted"}:
+        if task_id not in accepted and status in {
+            "blocked",
+            "cancelled",
+            "assigned",
+            "in_progress",
+            "accepted",
+        }:
             blocked.add(task_id)
     blocked.update(task_id for task_id in active_tasks if isinstance(task_id, str))
     return _ready_nodes(graph, accepted, blocked)

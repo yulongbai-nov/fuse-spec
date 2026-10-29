@@ -206,6 +206,96 @@ def test_retry_is_rejected_when_another_assignment_for_the_task_is_active() -> N
         fuse_record.append_retry(record, first["id"])
 
 
+def test_rca_candidate_and_review_context_survive_retry_and_are_immutable() -> None:
+    record = make_record()
+    baseline = fuse_record.add_candidate(record, {"source": "before"})["candidate_id"]
+    changed = fuse_record.add_candidate(record, {"source": "after"})["candidate_id"]
+    rca = fuse_record.prepare_assignment(
+        record, "T1", "Bug Fix", "rca", rca_base_candidate_id=baseline
+    )
+    attempt = rca["attempts"][0]
+    fuse_record.bind_launch(record, rca["id"], attempt["id"], "rca-host")
+    with pytest.raises(
+        fuse_record.RecordError, match="rca_base_candidate_id cannot change"
+    ):
+        fuse_record.record_attempt_result(
+            record,
+            rca["id"],
+            attempt["id"],
+            "succeeded",
+            {"rca_base_candidate_id": changed},
+        )
+    fuse_record.record_attempt_result(
+        record, rca["id"], attempt["id"], "succeeded", {"rca_candidate_id": changed}
+    )
+    reviewer = fuse_record.prepare_assignment(
+        record,
+        "T1",
+        "Review",
+        "rca_reviewer",
+        review_candidate_id=changed,
+        rca_attempt_ids=[attempt["id"]],
+    )
+    review_attempt = reviewer["attempts"][0]
+    fuse_record.bind_launch(record, reviewer["id"], review_attempt["id"], "review-host")
+    with pytest.raises(fuse_record.RecordError, match="rca_attempt_ids cannot change"):
+        fuse_record.record_attempt_result(
+            record,
+            reviewer["id"],
+            review_attempt["id"],
+            "succeeded",
+            {"rca_attempt_ids": []},
+        )
+    fuse_record.record_attempt_result(
+        record, reviewer["id"], review_attempt["id"], "failed"
+    )
+    fuse_record.append_retry(record, reviewer["id"])
+    assert reviewer["attempts"][-1]["result"]["rca_attempt_ids"] == [attempt["id"]]
+    before = copy.deepcopy(record)
+    reviewer["attempts"][-1]["result"]["rca_attempt_ids"] = []
+    with pytest.raises(
+        fuse_record.RecordError, match="dispatch rca_attempt_ids is immutable"
+    ):
+        fuse_record.validate_run_record(record, previous=before)
+
+
+def test_check_finding_rejects_generic_resolution_and_superseded_pass() -> None:
+    record = make_record()
+    candidate_id = fuse_record.add_candidate(record, {"source": "current"})[
+        "candidate_id"
+    ]
+    fuse_record.prepare_assignment(record, "T1", "Feature", "worker")
+    first = fuse_record.add_evidence(
+        record, candidate_id, "check", "fail", "failed", check_id="tests"
+    )
+    finding = fuse_record.add_finding(
+        record, "T1", "Check failed", scope="check:tests", evidence_ids=[first["id"]]
+    )
+    old_pass = fuse_record.add_evidence(
+        record, candidate_id, "check", "pass", "passed", check_id="tests"
+    )
+    fuse_record.add_evidence(
+        record, candidate_id, "check", "inconclusive", "unknown", check_id="tests"
+    )
+    before = copy.deepcopy(record)
+    with pytest.raises(fuse_record.RecordError, match="check findings require"):
+        fuse_record.resolve_finding(
+            record, finding["id"], "reviewed", old_pass["id"], candidate_id=candidate_id
+        )
+    with pytest.raises(fuse_record.RecordError, match="matching passing evidence"):
+        fuse_record.resolve_check_finding(
+            record, finding["id"], "T1", "tests", candidate_id, old_pass["id"]
+        )
+    assert record == before
+    latest = fuse_record.add_evidence(
+        record, candidate_id, "check", "pass", "passed", check_id="tests"
+    )
+    fuse_record.resolve_check_finding(
+        record, finding["id"], "T1", "tests", candidate_id, latest["id"]
+    )
+    assert finding["status"] == "resolved"
+
+
 def test_record_rejects_multiple_active_assignments_for_one_task() -> None:
     record = make_record()
     first = fuse_record.prepare_assignment(record, "T1", "Feature", "worker")
