@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import shutil
 import subprocess
@@ -1581,6 +1582,246 @@ def test_failed_check_retries_reuse_task_finding_and_rca_allowance(
         ]
         == "open"
     )
+
+
+def test_failed_check_revokes_acceptance_until_latest_pass_is_accepted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root, spec_dir = make_project(
+        tmp_path,
+        "# Tasks\n\n"
+        "- [ ] T1 Work [id:T1 deps: impl:R1,D-Test]\n"
+        "- [ ] T2 Dependent [id:T2 deps:T1 impl:R1,D-Test]\n"
+        "- [ ] T3 Independent [id:T3 deps: impl:R1,D-Test]\n",
+    )
+    config_path = root / ".fuse" / "config.toml"
+    prefix = config_path.read_text(encoding="utf-8").split("[checks.pytest]", 1)[0]
+    command = [
+        sys.executable,
+        "-c",
+        "import os; raise SystemExit(int(os.environ['FUSE_TEST_CHECK_EXIT']))",
+    ]
+    config_path.write_text(
+        prefix
+        + "[checks.smoke]\n"
+        + f"command = {json.dumps(command)}\n"
+        + "prerequisites = []\n"
+        + 'inputs = ["app.py"]\n'
+        + 'pass_criteria = "exit_code == 0"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        fuse_checks,
+        "prepare_toolchain",
+        lambda *_args: {
+            "ready": True,
+            "summary": "test selected toolchain is available",
+            "tool_versions": {"python": "3.11"},
+        },
+    )
+    run_id = initialized_run(root, spec_dir)
+    finish_assignment(root, spec_dir, run_id, "T1", "Feature", "worker", "worker-1")
+    config = fuse_config.load_config(config_path)
+    record = fuse_state.load_run(root, run_id)
+    candidate_id = record["candidates"][-1]["candidate_id"]
+
+    def run_check(exit_code: int) -> None:
+        monkeypatch.setenv("FUSE_TEST_CHECK_EXIT", str(exit_code))
+        status = fuse_cli.main(
+            [
+                "run-check",
+                "--repo-root",
+                str(root),
+                "--spec-dir",
+                str(spec_dir),
+                "--run-id",
+                run_id,
+                "--task-id",
+                "T1",
+                "--check-id",
+                "smoke",
+                "--candidate-id",
+                candidate_id,
+            ]
+        )
+        result = json.loads(capsys.readouterr().out)
+        assert status == 0, result
+        assert result["outcome"] == ("pass" if exit_code == 0 else "fail")
+
+    run_check(0)
+    reviewer = finish_assignment(
+        root, spec_dir, run_id, "T1", "Review", "reviewer", "reviewer-1"
+    )
+    report = tmp_path / "review.md"
+    report.write_text("Current candidate reviewed.\n", encoding="utf-8")
+    reviewed = submit_review(
+        root,
+        spec_dir,
+        run_id,
+        reviewer["assignment_id"],
+        candidate_id,
+        report,
+        outcome="pass",
+        summary="Current candidate passed review.",
+    )
+    assert reviewed.returncode == 0, reviewed.stdout
+    accepted = run_cli(root, spec_dir, "accept", "--run-id", run_id, "--task-id", "T1")
+    assert accepted.returncode == 0, accepted.stdout
+    before_failure = fuse_state.load_run(root, run_id)
+    assert before_failure["tasks"]["T1"]["status"] == "accepted"
+
+    run_check(1)
+    record = fuse_state.load_run(root, run_id)
+    assert record["tasks"]["T1"]["status"] == "blocked"
+    assert record["tasks"]["T1"]["accepted_candidate_id"] is None
+    finding_id = record["findings"][0]["id"]
+    assert record["findings"][0]["status"] == "open"
+    inspected = payload(run_cli(root, spec_dir, "inspect", "--run-id", run_id))
+    assert inspected["accepted_task_ids"] == []
+    assert inspected["eligible_task_ids"] == ["T3"]
+    for task_id, method, allowed in (
+        ("T1", "Bug Fix", True),
+        ("T2", "Feature", False),
+        ("T3", "Feature", True),
+    ):
+        decision = fuse_control.validate_transition(
+            "prepare-dispatch",
+            repository_root=root,
+            spec_dir=spec_dir,
+            config=config,
+            record=record,
+            task_id=task_id,
+            method=method,
+            role_profile="worker",
+        )
+        assert decision.allowed is allowed, decision.as_dict()
+    refused = run_cli(
+        root,
+        spec_dir,
+        "prepare-dispatch",
+        "--run-id",
+        run_id,
+        "--task-id",
+        "T2",
+        "--method",
+        "Feature",
+        "--role-profile",
+        "worker",
+    )
+    assert refused.returncode != 0
+    assert payload(refused)["reason"] == "task_not_ready"
+
+    run_check(0)
+    record = fuse_state.load_run(root, run_id)
+    assert record["findings"][0]["id"] == finding_id
+    assert record["findings"][0]["status"] == "resolved"
+    assert record["tasks"]["T1"]["status"] == "in_progress"
+    assert record["tasks"]["T1"]["accepted_candidate_id"] is None
+    assert payload(run_cli(root, spec_dir, "inspect", "--run-id", run_id))[
+        "eligible_task_ids"
+    ] == ["T3"]
+    for method, role, allowed in (
+        ("Feature", "worker", False),
+        ("Review", "reviewer", True),
+    ):
+        decision = fuse_control.validate_transition(
+            "prepare-dispatch",
+            repository_root=root,
+            spec_dir=spec_dir,
+            config=config,
+            record=record,
+            task_id="T1",
+            method=method,
+            role_profile=role,
+        )
+        assert decision.allowed is allowed, decision.as_dict()
+    accepted_again = run_cli(
+        root, spec_dir, "accept", "--run-id", run_id, "--task-id", "T1"
+    )
+    assert accepted_again.returncode == 0, accepted_again.stdout
+    assert payload(run_cli(root, spec_dir, "inspect", "--run-id", run_id))[
+        "eligible_task_ids"
+    ] == ["T2", "T3"]
+    final = fuse_state.load_run(root, run_id)
+    assert final["assignments"] == before_failure["assignments"]
+    assert (
+        final["evidence"][: len(before_failure["evidence"])]
+        == before_failure["evidence"]
+    )
+    assert final["review_counters"] == before_failure["review_counters"]
+    assert final["rca_attempts"] == before_failure["rca_attempts"]
+
+
+@pytest.mark.parametrize("newer_outcome", ["fail", "unavailable", "inconclusive"])
+def test_check_outcome_rejects_superseded_evidence_without_changing_history(
+    tmp_path: Path, newer_outcome: str
+) -> None:
+    root, spec_dir = make_project(tmp_path)
+    run_id = initialized_run(root, spec_dir)
+    record = fuse_state.load_run(root, run_id)
+    config = fuse_config.load_config(root / ".fuse" / "config.toml")
+    candidate_id = record["candidates"][-1]["candidate_id"]
+
+    def append_outcome(outcome: str) -> str:
+        return str(
+            fuse_record.add_evidence(
+                record, candidate_id, "check", outcome, outcome, check_id="pytest"
+            )["id"]
+        )
+
+    def record_outcome(evidence_id: str) -> dict[str, Any] | None:
+        return fuse_control.record_check_outcome(
+            record, root, spec_dir, config, "T1", "pytest", candidate_id, evidence_id
+        )
+
+    first_failure = append_outcome("fail")
+    finding = record_outcome(first_failure)
+    assert finding is not None
+    finding_id = finding["id"]
+    fuse_record.reserve_task_repair(record, "T1", limit=2)
+    fuse_record.reserve_rca_attempt(record, finding_id, limit=1)
+    old_pass = append_outcome("pass")
+    record_outcome(old_pass)
+    latest_failure = append_outcome("fail")
+    record_outcome(latest_failure)
+    assert finding["status"] == "open"
+    if newer_outcome != "fail":
+        append_outcome(newer_outcome)
+    before_replay = copy.deepcopy(record)
+
+    with pytest.raises(fuse_control.ControlError) as replay:
+        record_outcome(old_pass)
+    assert replay.value.reason == "check_evidence_superseded"
+    assert record == before_replay
+    if newer_outcome != "fail":
+        with pytest.raises(fuse_control.ControlError) as old_failure:
+            record_outcome(latest_failure)
+        assert old_failure.value.reason == "check_evidence_superseded"
+        assert record == before_replay
+    else:
+        assert record_outcome(latest_failure) == finding
+        assert record == before_replay
+
+    latest_pass = append_outcome("pass")
+    record_outcome(latest_pass)
+    assert finding["id"] == finding_id
+    assert finding["status"] == "resolved"
+    assert finding["history"][-1]["evidence_ids"] == [latest_pass]
+    after_resolution = copy.deepcopy(record)
+    assert record_outcome(latest_pass) == finding
+    assert record == after_resolution
+    with pytest.raises(fuse_control.ControlError) as old_failure:
+        record_outcome(latest_failure)
+    assert old_failure.value.reason == "check_evidence_superseded"
+    assert record == after_resolution
+    assert (
+        record["evidence"][: len(before_replay["evidence"])]
+        == before_replay["evidence"]
+    )
+    assert record["review_counters"] == before_replay["review_counters"]
+    assert record["rca_attempts"] == before_replay["rca_attempts"]
 
 
 def test_review_replay_is_rejected_and_reopened_normalized_finding_keeps_id(

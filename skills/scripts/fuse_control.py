@@ -930,6 +930,21 @@ def validate_transition(
                 check_id=check_id,
                 candidate_id=current_id,
             )
+        latest_evidence = next(
+            item
+            for item in reversed(current["evidence"])
+            if item["kind"] == "check"
+            and item.get("check_id") == check_id
+            and item.get("candidate_id") == current_id
+        )
+        if latest_evidence["id"] != evidence_id:
+            return _deny(
+                "check_evidence_superseded",
+                "a newer result supersedes this check evidence for the candidate",
+                check_id=check_id,
+                candidate_id=current_id,
+                latest_evidence_id=latest_evidence["id"],
+            )
         return _allow(
             task_id=task_id,
             check_id=check_id,
@@ -1330,10 +1345,13 @@ def record_check_outcome(
         None,
     )
     if evidence["outcome"] == "fail":
-        record["tasks"].setdefault(
+        state = record["tasks"].setdefault(
             task_id,
             {"status": "pending", "assignment_ids": [], "accepted_candidate_id": None},
         )
+        state["accepted_candidate_id"] = None
+        if state["status"] == "accepted":
+            state["status"] = "blocked"
         rationale = f"Check {check_id} failed: {evidence['summary']}"
         if finding is None:
             finding = fuse_record.add_finding(
@@ -1357,7 +1375,7 @@ def record_check_outcome(
             "deferred",
         }
     ):
-        return fuse_record.resolve_check_finding(
+        finding = fuse_record.resolve_check_finding(
             record,
             finding["id"],
             task_id,
@@ -1365,6 +1383,15 @@ def record_check_outcome(
             candidate_id,
             evidence_id,
         )
+        state = record["tasks"][task_id]
+        if state["status"] == "blocked" and not any(
+            item["task_id"] == task_id
+            and item["blocking"]
+            and item["status"] in {"open", "deferred"}
+            for item in record["findings"]
+        ):
+            state["status"] = "in_progress"
+        fuse_record.validate_run_record(record)
     return finding
 
 
