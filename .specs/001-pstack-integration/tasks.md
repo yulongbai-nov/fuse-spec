@@ -31,7 +31,7 @@
     - Persist a dispatch assignment and reserve capacity before host launch; bind the returned host handle afterward. On resume, unresolved launches remain reserved until reconciled and cannot be relaunched as duplicates.
     - Checkpoint the required state transitions and exact code/PR identities. Keep large output in referenced artifacts and ensure a missing required artifact makes its evidence unavailable.
 
-- [ ] T4 Implement deterministic task/check readiness and candidate-bound evidence  [id:T4 deps:T2,T3 impl:R1,R3,R4,R8,D-RunControl,D-Verification]
+- [x] T4 Implement deterministic task/check readiness and candidate-bound evidence  [id:T4 deps:T2,T3 impl:R1,R3,R4,R8,D-RunControl,D-Verification]
     - **Files:** `skills/scripts/fuse_graph.py`, `skills/scripts/fuse_candidate.py`, `skills/scripts/fuse_checks.py`, `tests/`
     - Test duplicate/unknown/self/cyclic task and check references, independent ready checks, real prerequisites, stable ready-ID presentation, and blocked work that does not stop unrelated eligible work.
     - Derive task readiness from approved task declarations plus accepted run state. Derive the check DAG from `.fuse/config.toml` plus task applicability; use `graphlib` for scheduling mechanics after Fuse validation.
