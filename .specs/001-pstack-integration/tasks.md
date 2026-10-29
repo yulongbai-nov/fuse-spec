@@ -16,12 +16,12 @@
     - Annotate new or changed Python code; format and lint it, then run the selected type checker and tests.
     - Commit this atomic code job and push it; open or update the draft PR after its first pushable code commit.
 
-- [ ] T2 Add the shared Fuse policy and project-check configuration  [id:T2 deps:T1 impl:R2,R3,R7,R8,D-Verification]
+- [x] T2 Add the shared Fuse policy and project-check configuration  [id:T2 deps:T1 impl:R2,R3,R7,R8,D-Verification]
     - **Files:** `.fuse/config.toml`, `schemas/project-config.schema.json`, `skills/scripts/fuse_config.py`, `tests/`
     - Write failing tests for malformed configuration, invalid role profiles, unavailable-profile fallback policy, invalid check IDs/references, and repeated initialization.
     - Define one `.fuse/config.toml` authority for model profiles, review/RCA limits, concurrency and optional budgets, allowed overrides, toolchain policy, and named check definitions with commands, prerequisites, inputs, and pass criteria.
     - Validate the parsed TOML against the versioned JSON Schema, then apply semantic checks for references, bounds, and supported check/role shapes. Store defaults as data and record the host-resolved profile at execution time.
-    - Verify that an existing target project configuration/package manager is reused and that a missing selected tool is restored only under its existing version and lock policy.
+    - Record the selected runtime, package manager, manifest, lockfile, and tool-restoration policy. Initialization validates that the selected files exist and are compatible, reuses an existing configuration, and fails closed without changing consumer package files when the default or supplied pre-assessed template does not match. It does not install tools.
 
 - [ ] T3 Add the versioned run record and single-writer state backend  [id:T3 deps:T1,T2 impl:R2,R3,R5,D-RunControl]
     - **Files:** `schemas/run-record.schema.json`, `skills/scripts/fuse_record.py`, `skills/scripts/fuse_state.py`, `tests/`
@@ -36,6 +36,7 @@
     - Derive task readiness from approved task declarations plus accepted run state. Derive the check DAG from `.fuse/config.toml` plus task applicability; use `graphlib` for scheduling mechanics after Fuse validation.
     - Create canonical immutable candidate manifests covering the source tree, approved spec inputs (normalizing checkbox-only status), effective policy, check definitions, and required fixtures/toolchain inputs. Exclude run-state and progress metadata.
     - Execute project-owned commands from the shared local/CI check entry point in pinned worktrees. Capture exit status, output artifacts, config/tool versions, and candidate IDs; reject stale, missing, failed, or mismatched results at acceptance.
+    - Before a required check, restore a missing selected project-local tool only through the configured package manager, version constraints, and existing lockfile policy. If restoration fails or the selection conflicts, report an unavailable prerequisite and block affected work while unrelated checks remain eligible.
     - Test that code or policy changes invalidate affected evidence and that state-only or checkbox-only changes do not change the implementation candidate.
 
 - [ ] T5 Add the control CLI and validated transition/acceptance gates  [id:T5 deps:T3,T4 impl:R2,R3,R4,R5,R6,D-RunControl,D-Verification]
@@ -48,7 +49,7 @@
     - Invoke executable checks directly and summarize verified output for agents; do not spend model calls re-interpreting successful mechanical checks.
 
 - [ ] T6 Integrate Poteto routing with the existing Fuse coordinator and worker roles  [id:T6 deps:T2,T4,T5 impl:R1,R2,R3,R6,R7,D-Coordinator,D-RunControl]
-    - **Files:** `skills/spec-execute/SKILL.md`, `skills/poteto-mode/SKILL.md`, `skills/poteto-mode/playbooks/`, `skills/agents/`, `tests/`
+    - **Files:** `skills/spec-execute/SKILL.md`, `skills/poteto-mode/SKILL.md`, `skills/poteto-mode/playbooks/`, `skills/agents/`, `tests/test_poteto_routing.py`
     - Add a focused route-table/scenario test set for Feature, Bug Fix, Refactoring, existing research, and the conditional performance, runtime/trace forensics, prototype, and visual-parity methods. Keep investigation inside Fuse's current research phase and Hillclimb deferred.
     - Make the `spec-execute` parent own the run and select/record one method before validating and dispatching each assignment. Give each worker scope, requirements/design references, success criteria, role profile, and checks; workers request reroutes through the parent.
     - Invoke managed operations through `fuse_launch.py` with the selected consuming repository root and spec directory; do not rely on the plugin's changed working directory for repository context.
@@ -56,7 +57,7 @@
     - Preserve bounded one-spec execution, in-scope task splitting/reordering, review counters, carry-forward findings, the one RCA attempt per hard blocker, and shared nested-agent concurrency accounting. Hooks remain optional context aids, never required acceptance gates.
 
 - [ ] T7 Add serialized GitHub PR publication and exact merge-candidate gates  [id:T7 deps:T3,T4,T5 impl:R3,R4,R5,D-PRIntegration,D-RunControl,D-Verification]
-    - **Files:** `skills/scripts/fuse_git.py`, `skills/scripts/fuse_pr.py`, `tests/`
+    - **Files:** `skills/scripts/fuse_git.py`, `skills/scripts/fuse_pr.py`, `tests/test_pr_provider.py`
     - Test isolated worker commits, one coordinator publisher, task-to-PR mapping, early draft-PR creation, per-job push/checkpoint order, acyclic derived PR dependencies, and refusal to force-push or bypass repository protection.
     - Use `gh` where available for PR/status operations and record provider, PR, base, and head identities. Keep provider calls behind a testable adapter and report missing CLI/auth/permissions as a blocker.
     - Materialize the integrated review candidate and the exact current base plus prerequisites plus target PR candidate before each merge. Recompute and rerun affected checks/reviews after base or prior-merge changes.
@@ -74,3 +75,4 @@
     - Configure CI to invoke the same project-owned check entry point and definitions as local Fuse execution. Keep only provisioning, credentials, triggers, caching, and artifact transport specific to the workflow environment.
     - Document setup, supported Python version, configuration, command usage, state-ref recovery, Codex capability limits, routes, evidence gates, and clear unverified/blocked outcomes. Keep full transcripts and unrelated work outside the run record.
     - Run traceability, dependency planning, all project checks, and the task-, integrated-PR-, and whole-codebase review levels. Resolve findings within their configured maximum of two rounds per level before merge.
+
